@@ -411,6 +411,61 @@ Triggers split by what CSS can express:
   Product card --on click--> Product detail
   ```
 
+## Organised files and real ones
+
+The same generator produces excellent code from a disciplined file and a pile of
+absolutely-positioned divs from a dragged-together one. That is the honest
+translation of what is there — but handing back `position: absolute` and class
+names like `frame427` without comment leaves you with no idea why.
+
+Measured on two ~200-node dashboards describing the same screen:
+
+| | organised | dragged together |
+|---|---|---|
+| nodes | 131 | 227 |
+| outline tokens | 461 | 499 |
+| flex rules | 6 | **0** |
+| absolute rules | 0 | **13** |
+| token-bound fills | 25 | **0** |
+| components referenced | 1 | **0** |
+| `.map()` runs | 2 | **2** |
+| default layer names | 0 | **203** |
+
+Two things stand out. **Repetition detection is unaffected by mess** — both files
+collapse their repeated cards into the same two list renders, and cost almost the
+same to read, because structural identity does not depend on good naming. And
+**everything else degrades exactly where the file does**.
+
+So the scene is assessed and reported. A clean file pays nothing for this and
+hears nothing; a broken one is told what specifically is costing it:
+
+```
+Design health:
+  ! None of the 62 multi-child containers use auto layout, so every child is
+    emitted as position:absolute. The result will not reflow for content,
+    translation or viewport size.
+    fix: Select a frame in Figma and press Shift+A to add auto layout. Do the
+         outermost frames first; the gain compounds downwards.
+  ! No fill is bound to a variable, so all 49 colours are emitted as literal hex.
+    fix: Create colour variables and bind the fills to them.
+  ! 89% of layers still have default names (203 of 227), e.g. "Frame 427".
+    fix: Rename the layers you care about before generating. Cheapest change
+         with the largest effect on how readable the output is.
+  ! 34 nodes repeat 2 identical structures, but the selection contains no
+    component instances. These look like detached copies.
+    fix: Turn one into a component and swap the copies for instances.
+  - 24 containers wrap a single child while adding no size, padding or paint.
+    fix: Ungroup them (Cmd/Ctrl+Shift+G) to flatten the output.
+```
+
+That fourth finding is the one only this tool can make: it already computes a
+structure key per node to collapse repetition, so it can see that 34 nodes are
+the same shape *and* that none of them is an instance. That is a detached
+component, diagnosed without anybody asking.
+
+Every problem carries a fix, and a test fails if one does not — "improve your
+file" is not actionable, and "select the frame and press Shift+A" is.
+
 ## Tested under the worst conditions, not just the best
 
 `tests/adversarial.rs` exists because the happy-path tests prove the tool *works*
@@ -530,7 +585,7 @@ WebSockets — use Figma Desktop there, or terminate TLS locally.
 ## Development
 
 ```bash
-cargo test                                      # 109 tests
+cargo test                                      # 117 tests
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all --check
 node --check plugin/code.js                     # syntax only; not a dependency
@@ -540,7 +595,7 @@ Four layers of test, all run by CI on Linux, macOS and Windows:
 
 | Suite | What it covers |
 |---|---|
-| unit (62) | The layout mapping, codegen rules, and motion — including a test that fails if `getCSSAsync()` ever overrides the IR's layout, and one asserting an underdamped spring actually overshoots while an overdamped one does not |
+| unit (70) | The layout mapping, codegen rules, and motion — including a test that fails if `getCSSAsync()` ever overrides the IR's layout, and one asserting an underdamped spring actually overshoots while an overdamped one does not |
 | `tests/bridge_roundtrip.rs` (8) | The real WebSocket server driven by a fake plugin — wire protocol, IR, motion and codegen end to end, without Figma |
 | `tests/plugin_consistency.rs` (7) | Rust/plugin drift: port agreement across `main.rs`, `manifest.json` and `ui.html`; every op the server calls exists in the plugin and none are dead; no synchronous Figma APIs under `documentAccess: dynamic-page` |
 | `tests/lsp_protocol.rs` (7) | The real LSP client against a fake language server over an in-memory pipe — framing, handshake, request correlation, fuzzy-match rejection, `node_modules` deprioritisation, and that a hung server times out instead of blocking generation |

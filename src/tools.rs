@@ -19,6 +19,7 @@ use serde_json::{Value, json};
 
 use crate::bridge::Bridge;
 use crate::codegen::{self, StyleMode};
+use crate::health;
 use crate::ir::{self, Token};
 use crate::lsp::{self, LspClient};
 use crate::motion::{self, Action, Interaction};
@@ -464,6 +465,13 @@ impl FigmaServer {
             outline::render(&nodes, &budget)
         };
 
+        // Only surfaced when there is a problem: a clean file should pay nothing
+        // for this, and a broken one should not have to ask.
+        let health = health::assess(&nodes);
+        if health.problems() > 0 {
+            body = format!("{}\n{body}", health.report());
+        }
+
         if clamped {
             body = format!(
                 "Note: depth {asked} was clamped to {MAX_WIRE_DEPTH}, the deepest tree the \
@@ -836,6 +844,11 @@ impl FigmaServer {
             "{}\n{verification}{} from {} nodes.\n",
             generated.stack_summary, generated.component_name, generated.node_count
         ));
+        // The generator is only as good as the file. Say which is the limit.
+        let report = health::assess(std::slice::from_ref(root)).report();
+        if !report.is_empty() {
+            out.push_str(&format!("\n{report}"));
+        }
         if !generated.imported_components.is_empty() {
             out.push_str(&format!(
                 "References existing components: {}. Wire these imports to your real paths.\n",

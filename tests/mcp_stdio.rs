@@ -102,13 +102,14 @@ fn every_tool_is_listed_with_a_description_and_schema() {
         "get_components",
         "export_assets",
         "generate_code",
+        "get_interactions",
     ] {
         assert!(
             names.contains(&expected),
             "tool {expected} is missing from {names:?}"
         );
     }
-    assert_eq!(names.len(), 8, "unexpected tool count: {names:?}");
+    assert_eq!(names.len(), 9, "unexpected tool count: {names:?}");
 
     for t in &tools {
         let name = t["name"].as_str().unwrap();

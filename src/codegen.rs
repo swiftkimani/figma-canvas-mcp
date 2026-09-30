@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::css::{self, Decls};
 use crate::ir::{Layout, Node, Token, pascal_case};
+use crate::motion::{Action, Interaction};
 
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema,
@@ -44,10 +45,26 @@ pub struct Generated {
     pub warnings: Vec<String>,
 }
 
+/// One emitted CSS rule. The comment carries design intent we can state but not
+/// generate — a hover target variant, for instance.
+struct Rule {
+    selector: String,
+    comment: Option<String>,
+    decls: Decls,
+}
+
+/// An event handler lifted from a prototype interaction into a React prop.
+struct Handler {
+    prop: String,
+    event: &'static str,
+    doc: String,
+}
+
 struct Ctx {
     mode: StyleMode,
-    /// class name -> declarations, in emission order.
-    rules: Vec<(String, Decls)>,
+    /// Emitted rules, in order.
+    rules: Vec<Rule>,
+    handlers: Vec<Handler>,
     used: HashMap<String, usize>,
     components: BTreeSet<String>,
     assets: Vec<String>,
@@ -82,6 +99,7 @@ pub fn generate(
     let mut ctx = Ctx {
         mode,
         rules: Vec::new(),
+        handlers: Vec::new(),
         used: HashMap::new(),
         components: BTreeSet::new(),
         assets: Vec::new(),
@@ -114,11 +132,35 @@ pub fn generate(
             .join("")
     };
 
+    // Deduplicate: the same destination reached from several nodes is one prop.
+    let mut handler_props: Vec<&Handler> = Vec::new();
+    for h in &ctx.handlers {
+        if !handler_props.iter().any(|e| e.prop == h.prop) {
+            handler_props.push(h);
+        }
+    }
+
+    let props_body = if handler_props.is_empty() {
+        "  className?: string;\n".to_string()
+    } else {
+        let mut b = String::from("  className?: string;\n");
+        for h in &handler_props {
+            b.push_str(&format!("  /** {} */\n  {}?: () => void;\n", h.doc, h.prop));
+        }
+        b
+    };
+    let destructured = if handler_props.is_empty() {
+        "className".to_string()
+    } else {
+        let names: Vec<String> = handler_props.iter().map(|h| h.prop.clone()).collect();
+        format!("className, {}", names.join(", "))
+    };
+
     let tsx = format!(
         "// Generated from Figma by figma-canvas-mcp. Re-generating overwrites this file.\n\
          {component_imports}{style_import}\n\
-         export interface {name}Props {{\n  className?: string;\n}}\n\n\
-         export function {name}({{ className }}: {name}Props) {{\n  return (\n{body}\n  );\n}}\n\n\
+         export interface {name}Props {{\n{props_body}}}\n\n\
+         export function {name}({{ {destructured} }}: {name}Props) {{\n  return (\n{body}\n  );\n}}\n\n\
          export default {name};\n"
     );
     files.push(GeneratedFile {
@@ -128,13 +170,19 @@ pub fn generate(
 
     if let Some(sheet_file) = &sheet_name {
         let mut sheet = String::from("/* Generated from Figma by figma-canvas-mcp. */\n");
-        for (class, decls) in &ctx.rules {
-            if decls.is_empty() {
+        for rule in &ctx.rules {
+            if rule.decls.is_empty() && rule.comment.is_none() {
                 continue;
             }
+            if let Some(c) = &rule.comment {
+                for line in c.lines() {
+                    sheet.push_str(&format!("/* {line} */\n"));
+                }
+            }
             sheet.push_str(&format!(
-                ".{class} {{\n{}\n}}\n\n",
-                css::to_block(decls, "  ")
+                ".{} {{\n{}\n}}\n\n",
+                rule.selector,
+                css::to_block(&rule.decls, "  ")
             ));
         }
         files.push(GeneratedFile {
@@ -160,6 +208,153 @@ pub fn generate(
     }
 }
 
+/// Name a React prop after what the interaction actually does, so the generated
+/// interface reads like intent rather than like Figma node ids.
+fn handler_for(i: &Interaction) -> Option<Handler> {
+    let event = i.trigger.handler()?;
+    let (suffix, doc) = match &i.action {
+        Action::Navigate {
+            destination_name, ..
+        } => {
+            let to = destination_name
+                .clone()
+                .unwrap_or_else(|| "Destination".into());
+            (
+                format!("NavigateTo{}", pascal_case(&to)),
+                format!("Navigates to \"{to}\"."),
+            )
+        }
+        Action::OpenOverlay { destination_name } => {
+            let to = destination_name.clone().unwrap_or_else(|| "Overlay".into());
+            (
+                format!("Open{}", pascal_case(&to)),
+                format!("Opens the \"{to}\" overlay."),
+            )
+        }
+        Action::ScrollTo { destination_name } => {
+            let to = destination_name.clone().unwrap_or_else(|| "Target".into());
+            (
+                format!("ScrollTo{}", pascal_case(&to)),
+                format!("Scrolls to \"{to}\"."),
+            )
+        }
+        Action::SetVariable { variable_name } => {
+            let v = variable_name.clone().unwrap_or_else(|| "Variable".into());
+            (
+                format!("Set{}", pascal_case(&v)),
+                format!("Sets the \"{v}\" variable."),
+            )
+        }
+        Action::OpenUrl { url } => ("OpenLink".to_string(), format!("Opens {url}")),
+        Action::Back => ("Back".to_string(), "Goes back.".to_string()),
+        Action::CloseOverlay => ("Close".to_string(), "Closes the overlay.".to_string()),
+        // A variant swap is styling, not a callback.
+        Action::ChangeTo { .. } => return None,
+        Action::Other { .. } => return None,
+    };
+
+    let mut doc = doc;
+    if let Some(t) = &i.transition {
+        doc.push_str(&format!(
+            " Figma transition: {} over {}ms.",
+            t.kind.to_lowercase().replace('_', " "),
+            t.duration_ms.round()
+        ));
+    }
+    if let Some(d) = i.delay_ms {
+        doc.push_str(&format!(" Fires after {}ms.", d.round()));
+    }
+
+    Some(Handler {
+        prop: format!("on{suffix}"),
+        event,
+        doc,
+    })
+}
+
+/// Describe a hover/press target we can name but cannot generate, because the
+/// destination variant's styles live in a node we deliberately did not read.
+fn state_rule_comment(i: &Interaction) -> Option<String> {
+    let Action::ChangeTo {
+        destination_name, ..
+    } = &i.action
+    else {
+        return None;
+    };
+    let target = destination_name
+        .clone()
+        .unwrap_or_else(|| "another variant".into());
+    let motion = match &i.transition {
+        Some(t) => format!(
+            "{} {}ms {}{}",
+            t.kind.to_lowercase().replace('_', " "),
+            t.duration_ms.round(),
+            t.easing_css,
+            if t.easing_approximate {
+                " (approximate)"
+            } else {
+                ""
+            }
+        ),
+        None => "no transition".to_string(),
+    };
+    Some(format!(
+        "Figma animates this to \"{target}\" ({motion}).\nAdd the properties that change:"
+    ))
+}
+
+/// Emit the CSS state rules for a node's hover/press interactions and return the
+/// JSX event attributes for the rest.
+///
+/// Shared by the instance and container paths, because a hover on a button
+/// instance is the single most common interaction in any real file.
+fn instance_props(inst: &crate::ir::Instance) -> String {
+    inst.props
+        .iter()
+        .map(|(k, v)| {
+            let key = prop_key(k);
+            if v == "true" || v == "false" {
+                format!(" {key}={{{v}}}")
+            } else {
+                format!(" {key}=\"{}\"", escape_attr(v))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+fn interaction_attrs(node: &Node, class: &str, ctx: &mut Ctx) -> String {
+    let mut events = String::new();
+    let mut seen_events: Vec<&str> = Vec::new();
+
+    for i in &node.interactions {
+        if i.trigger.pseudo_class().is_some() {
+            if let (Some(sel), Some(comment)) = (i.trigger.pseudo_class(), state_rule_comment(i)) {
+                ctx.rules.push(Rule {
+                    selector: format!("{class}{sel}"),
+                    comment: Some(comment),
+                    decls: Decls::new(),
+                });
+            }
+            continue;
+        }
+        if let Some(h) = handler_for(i) {
+            // Two actions on one trigger would collide on the same JSX attribute.
+            if seen_events.contains(&h.event) {
+                ctx.warnings.push(format!(
+                    "node \"{}\" has more than one {} action; only the first is wired",
+                    node.name, h.event
+                ));
+                continue;
+            }
+            seen_events.push(h.event);
+            events.push_str(&format!(" {}={{{}}}", h.event, h.prop));
+            ctx.handlers.push(h);
+        }
+    }
+    events
+}
+
 fn emit(
     node: &Node,
     parent: Option<&Layout>,
@@ -177,42 +372,54 @@ fn emit(
         // The component styles itself, but how it sits in this layout is ours to
         // say. Pass only placement through, on the className nearly every design
         // system component already accepts.
-        let placement = css::placement_only(css::declarations(node, parent));
-        let class_attr = if placement.is_empty() {
-            String::new()
-        } else {
-            let class = ctx.class_for(node);
-            match ctx.mode {
-                StyleMode::Inline => format!(" style={{{{{}}}}}", inline_style(&placement)),
-                StyleMode::CssModules => {
-                    ctx.rules.push((class.clone(), placement));
-                    format!(" className={{styles.{}}}", js_ident(&class))
+        let full = css::declarations(node, parent);
+        let mut placement = css::placement_only(full.clone());
+        // A hover on a button instance is the commonest interaction there is, so
+        // the transition has to survive the placement filter.
+        if let Some((k, v)) = full.iter().find(|(k, _)| k == "transition") {
+            placement.push((k.clone(), v.clone()));
+        }
+
+        if placement.is_empty() && node.interactions.is_empty() {
+            return format!("{pad}<{tag}{} />", instance_props(inst));
+        }
+
+        let class = ctx.class_for(node);
+        // Push the base rule before any state rule, so the sheet reads in order.
+        let class_attr = match ctx.mode {
+            StyleMode::Inline => {
+                if placement.is_empty() {
+                    String::new()
+                } else {
+                    format!(" style={{{{{}}}}}", inline_style(&placement))
                 }
-                StyleMode::Tailwind => {
-                    let (mut utils, leftover) = tailwind(&placement);
-                    if !leftover.is_empty() {
-                        ctx.rules.push((class.clone(), leftover));
-                        utils.push(class.clone());
-                    }
-                    format!(" className=\"{}\"", utils.join(" "))
+            }
+            StyleMode::CssModules => {
+                if !placement.is_empty() {
+                    ctx.rules.push(Rule {
+                        selector: class.clone(),
+                        comment: None,
+                        decls: placement,
+                    });
                 }
+                format!(" className={{styles.{}}}", js_ident(&class))
+            }
+            StyleMode::Tailwind => {
+                let (mut utils, leftover) = tailwind(&placement);
+                if !leftover.is_empty() {
+                    ctx.rules.push(Rule {
+                        selector: class.clone(),
+                        comment: None,
+                        decls: leftover,
+                    });
+                    utils.push(class.clone());
+                }
+                format!(" className=\"{}\"", utils.join(" "))
             }
         };
 
-        let props = inst
-            .props
-            .iter()
-            .map(|(k, v)| {
-                let key = prop_key(k);
-                if v == "true" || v == "false" {
-                    format!(" {key}={{{v}}}")
-                } else {
-                    format!(" {key}=\"{}\"", escape_attr(v))
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("");
-        return format!("{pad}<{tag}{class_attr}{props} />");
+        let events = interaction_attrs(node, &class, ctx);
+        return format!("{pad}<{tag}{class_attr}{events}{} />", instance_props(inst));
     }
 
     // 2. Vectors become assets — CSS cannot honestly reproduce a bezier path.
@@ -244,7 +451,11 @@ fn emit(
 
     let attr = match ctx.mode {
         StyleMode::CssModules => {
-            ctx.rules.push((class.clone(), decls));
+            ctx.rules.push(Rule {
+                selector: class.clone(),
+                comment: None,
+                decls,
+            });
             let own = format!("styles.{}", js_ident(&class));
             if is_root {
                 merge(own)
@@ -266,7 +477,11 @@ fn emit(
                 // No utility exists for these, so keep them in a stylesheet and
                 // put the class on the element. Dropping them would silently
                 // lose shadows, gradients and transforms.
-                ctx.rules.push((class.clone(), leftover));
+                ctx.rules.push(Rule {
+                    selector: class.clone(),
+                    comment: None,
+                    decls: leftover,
+                });
                 utils.push(class.clone());
             }
             let joined = utils.join(" ");
@@ -277,6 +492,9 @@ fn emit(
             }
         }
     };
+
+    let events = interaction_attrs(node, &class, ctx);
+    let attr = format!("{attr}{events}");
 
     // 3. Pure text.
     if node.is_text_only() {
@@ -341,10 +559,10 @@ fn tokens_css(tokens: &[Token]) -> String {
         out.push_str(&format!("{selector} {{\n"));
         for t in by_mode.get(*mode).into_iter().flatten() {
             if let Some(v) = t.values_by_mode.get(*mode) {
-                if let Some(desc) = &t.description {
-                    if !desc.is_empty() {
-                        out.push_str(&format!("  /* {} */\n", desc.replace("*/", "*\\/")));
-                    }
+                if let Some(desc) = &t.description
+                    && !desc.is_empty()
+                {
+                    out.push_str(&format!("  /* {} */\n", desc.replace("*/", "*\\/")));
                 }
                 out.push_str(&format!("  {}: {};\n", t.css_var, v));
             }
@@ -502,6 +720,7 @@ mod tests {
             figma_css: None,
             tokens: Default::default(),
             exportable: false,
+            interactions: vec![],
             children,
         }
     }

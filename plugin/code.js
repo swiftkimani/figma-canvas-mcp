@@ -264,6 +264,104 @@ async function projectInstance(node) {
 }
 
 // ---------------------------------------------------------------------------
+// prototype interactions
+// ---------------------------------------------------------------------------
+
+var nodeNameCache = Object.create(null);
+
+async function nodeName(id) {
+  if (!id) return null;
+  if (id in nodeNameCache) return nodeNameCache[id];
+  try {
+    var n = await figma.getNodeByIdAsync(id);
+    nodeNameCache[id] = n ? n.name : null;
+  } catch (e) {
+    nodeNameCache[id] = null;
+  }
+  return nodeNameCache[id];
+}
+
+// Figma exposes the bezier as {x1,y1,x2,y2} and the spring as
+// {mass,stiffness,damping,initialVelocity}. Older files use array form.
+function projectEasing(easing) {
+  if (!easing) return null;
+  var out = { type: easing.type };
+
+  var b = easing.easingFunctionCubicBezier;
+  if (b) {
+    out.cubicBezier = Array.isArray(b)
+      ? { x1: b[0], y1: b[1], x2: b[2], y2: b[3] }
+      : { x1: b.x1, y1: b.y1, x2: b.x2, y2: b.y2 };
+  }
+
+  var sp = easing.easingFunctionSpring;
+  if (sp) {
+    out.spring = {
+      mass: sp.mass,
+      stiffness: sp.stiffness,
+      damping: sp.damping,
+      initialVelocity: typeof sp.initialVelocity === 'number' ? sp.initialVelocity : 0
+    };
+  }
+  return out;
+}
+
+function projectTransition(t) {
+  if (!t) return null;
+  return {
+    type: t.type,
+    // Figma stores seconds; the server converts.
+    duration: typeof t.duration === 'number' ? t.duration : null,
+    easing: projectEasing(t.easing),
+    direction: t.direction || null,
+    matchLayers: typeof t.matchLayers === 'boolean' ? t.matchLayers : null
+  };
+}
+
+async function projectAction(a) {
+  var out = {
+    type: a.type,
+    destinationId: a.destinationId || null,
+    navigation: a.navigation || null,
+    url: a.url || null,
+    transition: projectTransition(a.transition)
+  };
+  if (a.destinationId) {
+    out.destinationName = await nodeName(a.destinationId);
+  }
+  // SET_VARIABLE carries the variable id; the name is what code needs.
+  if (a.type === 'SET_VARIABLE' && a.variableId) {
+    out.variableName = await variableName(a.variableId);
+  }
+  return out;
+}
+
+async function projectReactions(node) {
+  if (!('reactions' in node) || !node.reactions || !node.reactions.length) return [];
+  var out = [];
+  for (var i = 0; i < node.reactions.length; i++) {
+    var r = node.reactions[i];
+    // Newer files use `actions`; older ones a single `action`.
+    var actions = r.actions || (r.action ? [r.action] : []);
+    var projected = [];
+    for (var j = 0; j < actions.length; j++) {
+      if (actions[j]) projected.push(await projectAction(actions[j]));
+    }
+    out.push({
+      trigger: r.trigger
+        ? {
+            type: r.trigger.type,
+            timeout: typeof r.trigger.timeout === 'number' ? r.trigger.timeout : null,
+            delay: typeof r.trigger.delay === 'number' ? r.trigger.delay : null
+          }
+        : null,
+      actions: projected
+    });
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
 // the node projection
 // ---------------------------------------------------------------------------
 
@@ -363,6 +461,7 @@ async function projectNode(node, depth, includeCss) {
   }
 
   out.boundVariables = await boundVariables(node);
+  out.reactions = await projectReactions(node);
 
   if (node.type === 'TEXT') {
     out.text = await projectText(node);
@@ -500,6 +599,36 @@ var ops = {
 
     for (var i = 0; i < nodes.length; i++) await walk(nodes[i]);
     return Object.keys(found).map(function (k) { return found[k]; });
+  },
+
+  interactions: async function (p) {
+    var nodes = await resolve(p.nodeIds);
+    var out = [];
+
+    async function walk(node, path) {
+      var reactions = await projectReactions(node);
+      if (reactions.length) {
+        out.push({
+          nodeId: node.id,
+          nodeName: node.name,
+          nodeType: node.type,
+          path: path.join(' / '),
+          reactions: reactions
+        });
+      }
+      // Unlike the scene projection, walk into instances here: a prototype
+      // often lives on the instance rather than on the component.
+      if ('children' in node && node.children) {
+        for (var i = 0; i < node.children.length; i++) {
+          await walk(node.children[i], path.concat([node.children[i].name]));
+        }
+      }
+    }
+
+    for (var i = 0; i < nodes.length; i++) {
+      await walk(nodes[i], [nodes[i].name]);
+    }
+    return out;
   },
 
   export: async function (p) {

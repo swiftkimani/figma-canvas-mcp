@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::motion::{self, Interaction};
 use crate::raw::{RawInstance, RawNode, RawPaint, RawText, RawVariable};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -278,6 +279,8 @@ pub struct Node {
     /// Token bindings by Figma property name.
     pub tokens: BTreeMap<String, String>,
     pub exportable: bool,
+    /// Prototype interactions declared on this node, with motion resolved.
+    pub interactions: Vec<Interaction>,
     pub children: Vec<Node>,
 }
 
@@ -293,6 +296,11 @@ impl Node {
             self.kind.as_str(),
             "VECTOR" | "BOOLEAN_OPERATION" | "STAR" | "POLYGON" | "LINE"
         )
+    }
+
+    /// Does this subtree declare any prototype interaction?
+    pub fn has_interactions(&self) -> bool {
+        !self.interactions.is_empty() || self.children.iter().any(Node::has_interactions)
     }
 
     pub fn count(&self) -> usize {
@@ -431,6 +439,7 @@ fn convert(raw: &RawNode, parent: ParentCtx) -> Node {
         figma_css: raw.css.clone(),
         tokens: raw.bound_variables.clone(),
         exportable: raw.has_export_settings,
+        interactions: motion::read_reactions(&raw.reactions),
         children: raw
             .children
             .iter()

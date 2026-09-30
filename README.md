@@ -108,6 +108,7 @@ It reconnects on its own, so a Figma reload or a browser refresh needs no restar
 | `get_tokens` | Variables as design tokens, plus a ready `tokens.css` with every mode |
 | `get_components` | Which component each instance came from, and its variant values |
 | `export_assets` | SVG / PNG / JPG / PDF at any scale, written to disk |
+| `get_interactions` | Prototype triggers, actions, and motion — durations, easing, and the screen flow |
 | `generate_code` | React + TypeScript, with CSS modules, Tailwind, or inline styles |
 
 ## The part that actually matters: layout
@@ -142,6 +143,42 @@ Two rules drive this:
    `className`, because placement is the caller's decision while paint is the
    component's.
 
+## Motion
+
+Prototype interactions are read, not skipped. Figma's motion model is richer than
+CSS's, so each case is handled on its own terms:
+
+| Figma easing | Emitted | Exact? |
+|---|---|---|
+| `LINEAR`, `EASE_IN`, `EASE_OUT`, `EASE_IN_AND_OUT` | the CSS keyword | yes |
+| `CUSTOM_CUBIC_BEZIER` | `cubic-bezier(...)`, same control points | yes |
+| `CUSTOM_SPRING` | `linear(...)` stop list from a simulated oscillator | yes |
+| `EASE_*_BACK` | a `cubic-bezier` of the same shape | **no** — flagged in the output |
+
+Springs are the interesting one. There is no bezier that reproduces overshoot, so
+instead of flattening a spring into an ease-out, the damped oscillator is actually
+simulated and sampled into a CSS `linear()` stop list, whose values may exceed 1.
+The raw `{mass, stiffness, damping, initialVelocity}` is returned alongside, so
+Framer Motion or similar can use the spring natively.
+
+Triggers split by what CSS can express:
+
+- **Hover and press** become `:hover` / `:active`, with the `transition` placed on
+  the *base* rule so it animates in both directions. No JavaScript needed.
+- **Click, key, drag** become typed, documented React props:
+  ```tsx
+  export interface ProductCardProps {
+    className?: string;
+    /** Navigates to "Product detail". Figma transition: smart animate over 600ms. */
+    onNavigateToProductDetail?: () => void;
+  }
+  ```
+- **Navigation between frames** is also summarised as a flow graph, which is the
+  prototype's routing:
+  ```
+  Product card --on click--> Product detail
+  ```
+
 ## Known gaps
 
 Stated plainly, because a tool that hides its limits wastes your time:
@@ -175,12 +212,20 @@ to the dominant style; Figma's `figma.mixed` ranges are not split into spans.
 **No blend modes, masks, or vector paths.** Vectors are exported as SVG rather
 than reconstructed — correct, but it means they are assets, not markup.
 
+**Hover targets are named, not filled.** A hover that swaps to another variant
+emits the transition and a comment naming the destination, but the `:hover` rule
+is left empty — the destination variant's styles live in a node we deliberately do
+not read. Reading it and diffing the two would close this.
+
+**`AFTER_TIMEOUT` is reported, not generated.** Timed sequences come back with
+their delays, but are not turned into `@keyframes`.
+
 **Write is out of scope.** This reads. It never modifies your document.
 
 **Browser caveat:** Chrome and Edge treat `ws://127.0.0.1` as a
-potentially-trustworthy origin, so a page on `https://figma.com` may connect.
-Safari and Firefox are stricter about loopback WebSockets — use Figma Desktop
-there, or terminate TLS locally.
+potentially-trustworthy origin, so a page on `https://figma.com` connects without
+tripping mixed-content blocking. Safari and Firefox are stricter about loopback
+WebSockets — use Figma Desktop there, or terminate TLS locally.
 
 ## Roadmap
 
@@ -188,6 +233,8 @@ there, or terminate TLS locally.
   is a ZIP holding a `canvas.fig` Kiwi payload that **embeds its own schema**, so a
   decoder generated from the file survives Figma's continuous deploys. This is the
   path to CI and to files you can export but not open.
+- Reading a hover's destination variant and diffing it, to fill the `:hover` rule.
+- `@keyframes` for timed sequences.
 - Per-range text spans.
 - Full grid track reconstruction.
 - Vue and Svelte emitters — the IR is framework-agnostic; only `codegen` is not.
@@ -195,7 +242,7 @@ there, or terminate TLS locally.
 ## Development
 
 ```bash
-cargo test                                      # 36 tests
+cargo test                                      # 44 tests
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all --check
 node --check plugin/code.js                     # syntax only; not a dependency
@@ -205,8 +252,8 @@ Four layers of test, all run by CI on Linux, macOS and Windows:
 
 | Suite | What it covers |
 |---|---|
-| unit (20) | The layout mapping and codegen rules, including a test that fails if `getCSSAsync()` ever overrides the IR's layout |
-| `tests/bridge_roundtrip.rs` (6) | The real WebSocket server driven by a fake plugin — wire protocol, IR and codegen end to end, without Figma |
+| unit (27) | The layout mapping, codegen rules, and motion — including a test that fails if `getCSSAsync()` ever overrides the IR's layout, and one asserting an underdamped spring actually overshoots while an overdamped one does not |
+| `tests/bridge_roundtrip.rs` (7) | The real WebSocket server driven by a fake plugin — wire protocol, IR, motion and codegen end to end, without Figma |
 | `tests/plugin_consistency.rs` (7) | Rust/plugin drift: port agreement across `main.rs`, `manifest.json` and `ui.html`; every op the server calls exists in the plugin and none are dead; no synchronous Figma APIs under `documentAccess: dynamic-page` |
 | `tests/mcp_stdio.rs` (3) | A real `initialize` / `tools/list` / `tools/call` handshake against the compiled binary, asserting stdout is clean JSON-RPC |
 

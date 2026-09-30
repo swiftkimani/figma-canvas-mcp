@@ -269,6 +269,10 @@ pub struct RawNode {
     #[serde(default)]
     pub has_export_settings: bool,
 
+    /// Prototype interactions declared on this node.
+    #[serde(default)]
+    pub reactions: Vec<RawReaction>,
+
     #[serde(default)]
     pub children: Vec<RawNode>,
 }
@@ -293,4 +297,112 @@ pub struct RawVariable {
     pub values_by_mode: BTreeMap<String, String>,
     #[serde(default)]
     pub description: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Prototype interactions and motion
+// ---------------------------------------------------------------------------
+
+/// Figma's easing, which is richer than CSS's named keywords.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RawEasing {
+    /// LINEAR | EASE_IN | EASE_OUT | EASE_IN_AND_OUT | *_BACK |
+    /// CUSTOM_CUBIC_BEZIER | CUSTOM_SPRING
+    #[serde(rename = "type", default)]
+    pub kind: String,
+    #[serde(default)]
+    pub cubic_bezier: Option<RawCubicBezier>,
+    #[serde(default)]
+    pub spring: Option<RawSpring>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RawCubicBezier {
+    pub x1: f64,
+    pub y1: f64,
+    pub x2: f64,
+    pub y2: f64,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RawSpring {
+    #[serde(default)]
+    pub mass: f64,
+    #[serde(default)]
+    pub stiffness: f64,
+    #[serde(default)]
+    pub damping: f64,
+    #[serde(default)]
+    pub initial_velocity: f64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RawTransition {
+    /// DISSOLVE | SMART_ANIMATE | MOVE_IN | MOVE_OUT | PUSH | SLIDE_IN |
+    /// SLIDE_OUT | SCROLL_ANIMATE
+    #[serde(rename = "type", default)]
+    pub kind: String,
+    /// Figma stores seconds.
+    #[serde(default)]
+    pub duration: Option<f64>,
+    #[serde(default)]
+    pub easing: Option<RawEasing>,
+    /// LEFT | RIGHT | TOP | BOTTOM, for directional transitions.
+    #[serde(default)]
+    pub direction: Option<String>,
+    /// Smart Animate's layer matching.
+    #[serde(default)]
+    pub match_layers: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RawAction {
+    /// NODE | URL | BACK | CLOSE | OPEN_OVERLAY | SWAP_OVERLAY | SCROLL_TO |
+    /// SET_VARIABLE | CONDITIONAL
+    #[serde(rename = "type", default)]
+    pub kind: String,
+    #[serde(default)]
+    pub destination_id: Option<String>,
+    /// Resolved by the plugin so the name is usable without a second lookup.
+    #[serde(default)]
+    pub destination_name: Option<String>,
+    /// NAVIGATE | SWAP | OVERLAY | SCROLL_TO | CHANGE_TO
+    #[serde(default)]
+    pub navigation: Option<String>,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub transition: Option<RawTransition>,
+    /// For SET_VARIABLE, the variable's name.
+    #[serde(default)]
+    pub variable_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RawTrigger {
+    /// ON_CLICK | ON_HOVER | ON_PRESS | ON_DRAG | AFTER_TIMEOUT |
+    /// MOUSE_ENTER | MOUSE_LEAVE | MOUSE_DOWN | MOUSE_UP | ON_KEY_DOWN
+    #[serde(rename = "type", default)]
+    pub kind: String,
+    /// AFTER_TIMEOUT delay, in seconds.
+    #[serde(default)]
+    pub timeout: Option<f64>,
+    /// MOUSE_ENTER/LEAVE/DOWN/UP delay, in seconds.
+    #[serde(default)]
+    pub delay: Option<f64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RawReaction {
+    #[serde(default)]
+    pub trigger: Option<RawTrigger>,
+    #[serde(default)]
+    pub actions: Vec<RawAction>,
 }

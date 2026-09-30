@@ -1,3 +1,7 @@
+// The scene fixture is deliberately deep enough to exercise nesting, which
+// pushes serde_json's json! macro past its default expansion depth.
+#![recursion_limit = "512"]
+
 //! End-to-end test of the real bridge, with a fake plugin on the other end.
 //!
 //! This exercises the actual WebSocket server, the actual wire protocol, and the
@@ -38,6 +42,23 @@ fn fixture_scene() -> Value {
         "variableName": "color/surface/raised"
       }],
       "boundVariables": { "fills": "color/surface/raised", "itemSpacing": "space/md" },
+      "reactions": [{
+        "trigger": { "type": "ON_CLICK" },
+        "actions": [{
+          "type": "NODE",
+          "destinationId": "2:1",
+          "destinationName": "Product detail",
+          "navigation": "NAVIGATE",
+          "transition": {
+            "type": "SMART_ANIMATE",
+            "duration": 0.6,
+            "easing": {
+              "type": "CUSTOM_SPRING",
+              "spring": { "mass": 1, "stiffness": 180, "damping": 12, "initialVelocity": 0 }
+            }
+          }
+        }]
+      }],
       "children": [
         {
           "id": "1:2",
@@ -74,6 +95,20 @@ fn fixture_scene() -> Value {
             "isRemote": true
           },
           "boundVariables": {},
+          "reactions": [{
+            "trigger": { "type": "ON_HOVER" },
+            "actions": [{
+              "type": "NODE",
+              "destinationId": "10:6",
+              "destinationName": "Button/primary/hover",
+              "navigation": "CHANGE_TO",
+              "transition": {
+                "type": "SMART_ANIMATE",
+                "duration": 0.15,
+                "easing": { "type": "EASE_OUT" }
+              }
+            }]
+          }],
           "children": []
         }
       ]
@@ -374,4 +409,86 @@ async fn requests_time_out_without_hanging_forever() {
 
     let err = bridge.call("scene", json!({})).await.unwrap_err();
     assert!(err.to_string().contains("did not answer"), "got: {err}");
+}
+
+#[tokio::test]
+async fn animations_survive_the_round_trip_into_css_and_props() {
+    use figma_canvas_mcp::motion::{Action, Trigger};
+
+    let bridge = connected_bridge().await;
+    let raw = bridge.call("scene", json!({ "depth": 12 })).await.unwrap();
+    let roots: Vec<RawNode> = serde_json::from_value(raw).unwrap();
+    let scene = ir::build(&roots[0]);
+
+    assert!(
+        scene.has_interactions(),
+        "the fixture declares prototype motion"
+    );
+
+    // The card's click navigates, with a spring that must be simulated, not guessed.
+    let click = &scene.interactions[0];
+    assert_eq!(click.trigger, Trigger::Click);
+    assert!(
+        matches!(&click.action, Action::Navigate { destination_name, .. }
+        if destination_name.as_deref() == Some("Product detail"))
+    );
+
+    let t = click.transition.as_ref().expect("transition");
+    assert_eq!(t.duration_ms, 600.0, "0.6s must become 600ms");
+    assert!(t.smart_animate);
+    assert!(
+        t.easing_css.starts_with("linear("),
+        "spring easing: {}",
+        t.easing_css
+    );
+    assert!(!t.easing_approximate);
+    assert!(
+        t.spring.is_some(),
+        "raw spring params kept for motion libraries"
+    );
+
+    // The button's hover is CSS-expressible, so no handler is generated for it.
+    let hover = &scene.children[1].interactions[0];
+    assert_eq!(hover.trigger.pseudo_class(), Some(":hover"));
+    assert_eq!(hover.trigger.handler(), None);
+    assert!(matches!(hover.action, Action::ChangeTo { .. }));
+
+    let out = codegen::generate(&scene, &[], StyleMode::CssModules, None);
+    let tsx = &out
+        .files
+        .iter()
+        .find(|f| f.path.ends_with(".tsx"))
+        .unwrap()
+        .contents;
+    let sheet = &out
+        .files
+        .iter()
+        .find(|f| f.path.ends_with(".module.css"))
+        .unwrap()
+        .contents;
+
+    // Navigation becomes a typed, documented prop rather than a dead onClick.
+    assert!(
+        tsx.contains("onNavigateToProductDetail?: () => void;"),
+        "navigation should be a typed prop:\n{tsx}"
+    );
+    assert!(tsx.contains("onClick={onNavigateToProductDetail}"), "{tsx}");
+    assert!(
+        tsx.contains("Navigates to \"Product detail\""),
+        "prop should be documented:\n{tsx}"
+    );
+
+    // The hover transition lands on the base rule so it animates both ways.
+    assert!(
+        sheet.contains("transition: all 150ms ease-out;"),
+        "hover transition should be on the base rule:\n{sheet}"
+    );
+    // And the target variant is named, since we deliberately did not read it.
+    assert!(
+        sheet.contains("Button/primary/hover"),
+        "the hover target should be named in a comment:\n{sheet}"
+    );
+    assert!(sheet.contains(":hover {"), "{sheet}");
+
+    println!("--- tsx ---\n{tsx}\n--- css ---\n{sheet}");
 }

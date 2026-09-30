@@ -13,6 +13,7 @@
 //! absolutely-positioned boxes.
 
 use crate::ir::{Direction, Edges, Layout, Node, Placement, Sizing};
+use crate::motion;
 
 /// Ordered declarations, so output diffs stay readable.
 pub type Decls = Vec<(String, String)>;
@@ -191,10 +192,11 @@ pub fn declarations(node: &Node, parent: Option<&Layout>) -> Decls {
                 }
             }
 
-            if let Some(a) = align_self {
-                if !d.iter().any(|(k, _)| k == "align-self") {
-                    d.push(("align-self".into(), a.css().into()));
-                }
+            // Figma's per-child STRETCH only applies if FILL did not already set it.
+            if let Some(a) = align_self
+                && !d.iter().any(|(k, _)| k == "align-self")
+            {
+                d.push(("align-self".into(), a.css().into()));
             }
         }
         Placement::Absolute {
@@ -268,6 +270,13 @@ pub fn declarations(node: &Node, parent: Option<&Layout>) -> Decls {
         };
         d.retain(|(k, _)| k != prop && k != "background-color");
         d.push((prop.into(), fill.css_value()));
+    }
+
+    // A hover or press interaction in Figma means the property change should be
+    // animated. Putting the transition on the base rule (not the :hover rule) is
+    // what makes it animate in both directions.
+    if let Some(t) = motion::css_state_transition(&node.interactions) {
+        d.push(("transition".into(), t.css_shorthand("all")));
     }
 
     dedupe_last_wins(d)
@@ -362,10 +371,11 @@ fn appearance(node: &Node, d: &mut Decls) {
         if let Some(v) = &t.letter_spacing {
             d.push(("letter-spacing".into(), v.clone()));
         }
-        if let Some(v) = &t.align {
-            if v != "left" {
-                d.push(("text-align".into(), v.clone()));
-            }
+        // left is the CSS default, so emitting it is noise.
+        if let Some(v) = &t.align
+            && v != "left"
+        {
+            d.push(("text-align".into(), v.clone()));
         }
         if let Some(v) = &t.transform {
             d.push(("text-transform".into(), v.clone()));
@@ -478,6 +488,7 @@ mod tests {
             figma_css: None,
             tokens: Default::default(),
             exportable: false,
+            interactions: vec![],
             children: vec![],
         }
     }

@@ -15,6 +15,7 @@ use serde_json::{Value, json};
 use crate::bridge::Bridge;
 use crate::codegen::{self, StyleMode};
 use crate::ir::{self, Token};
+use crate::motion::{self, Action, Interaction};
 use crate::raw::{RawNode, RawVariable};
 
 fn bad(msg: impl Into<String>) -> ErrorData {
@@ -261,6 +262,7 @@ impl FigmaServer {
                 figma_css: None,
                 tokens: Default::default(),
                 exportable: false,
+                interactions: vec![],
                 children: vec![],
             },
             &tokens,
@@ -352,6 +354,102 @@ impl FigmaServer {
             return Ok("Nothing exported. Select a node in Figma, or pass node_ids.".into());
         }
         pretty(&json!({ "written": written }))
+    }
+
+    /// Motion and flow: what the prototype actually does.
+    #[tool(
+        description = "Read the prototype interactions on a selection: triggers (click, hover, \
+                       press, timeout), actions (navigate, open overlay, swap variant, set \
+                       variable, open URL), and the motion for each — transition type, duration \
+                       in ms, and a CSS-ready easing. Spring easings are simulated into a CSS \
+                       linear() stop list rather than approximated, and the raw spring parameters \
+                       are returned for motion libraries. Also summarises the screen-to-screen \
+                       flow, which is the prototype's routing."
+    )]
+    async fn get_interactions(
+        &self,
+        Parameters(args): Parameters<NodesArgs>,
+    ) -> Result<String, ErrorData> {
+        let params = self.nodes_param(args.node_ids).await;
+        let v = self.bridge.call("interactions", params).await?;
+
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Found {
+            node_id: String,
+            node_name: String,
+            node_type: String,
+            #[serde(default)]
+            path: String,
+            #[serde(default)]
+            reactions: Vec<crate::raw::RawReaction>,
+        }
+
+        let found: Vec<Found> = serde_json::from_value(v)
+            .map_err(|e| bad(format!("plugin sent interactions we could not decode: {e}")))?;
+
+        if found.is_empty() {
+            return Ok(
+                "No prototype interactions on this selection. Wired connections and \
+                       hover states live in Figma's Prototype tab."
+                    .into(),
+            );
+        }
+
+        let mut nodes = Vec::new();
+        let mut flow = Vec::new();
+        let mut approximations = Vec::new();
+
+        for f in &found {
+            let interactions: Vec<Interaction> = motion::read_reactions(&f.reactions);
+
+            for i in &interactions {
+                // The screen graph is the part that becomes routing.
+                if let Action::Navigate {
+                    destination_name, ..
+                } = &i.action
+                {
+                    flow.push(format!(
+                        "{} --{}--> {}",
+                        f.node_name,
+                        i.trigger_kind.to_lowercase().replace('_', " "),
+                        destination_name.as_deref().unwrap_or("?")
+                    ));
+                }
+                if let Some(t) = &i.transition
+                    && t.easing_approximate
+                {
+                    approximations.push(format!(
+                        "{}: {} has no exact CSS equivalent",
+                        f.node_name, t.easing_kind
+                    ));
+                }
+            }
+
+            nodes.push(json!({
+                "nodeId": f.node_id,
+                "nodeName": f.node_name,
+                "nodeType": f.node_type,
+                "path": f.path,
+                "interactions": interactions,
+            }));
+        }
+
+        let mut out = format!("{} node(s) carry prototype interactions.\n", found.len());
+        if !flow.is_empty() {
+            out.push_str("\nScreen flow:\n");
+            for f in &flow {
+                out.push_str(&format!("  {f}\n"));
+            }
+        }
+        if !approximations.is_empty() {
+            out.push_str("\nEasings that are approximated, not exact:\n");
+            for a in &approximations {
+                out.push_str(&format!("  {a}\n"));
+            }
+        }
+        out.push_str(&format!("\n{}", pretty(&json!({ "nodes": nodes }))?));
+        Ok(out)
     }
 
     /// The payoff: canvas to React.

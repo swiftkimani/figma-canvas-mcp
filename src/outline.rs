@@ -32,9 +32,10 @@ impl Default for Budget {
 /// The key, printed once, so the abbreviations below cost nothing to explain.
 pub const LEGEND: &str = "\
 id name · TYPE W×H · layout · sizing · paint
-  layout:  row|col gap<n> <justify>/<align> p<padding>  ·  abs(<x>,<y>)
+  layout:  row|col gap<n> <justify>/<align> p<padding>  ·  abs
   sizing:  w:fill|hug  h:fill|hug   (omitted when fixed)
-  paint:   bg:<token-or-colour>  ·  →export for vectors  ·  ⚡ has interactions";
+  paint:   bg:<token-or-colour>  ·  →export for vectors  ·  ⚡ has interactions
+  ×N       N consecutive siblings share this exact shape; only content differs";
 
 fn num(v: f64) -> String {
     if (v - v.round()).abs() < 0.5 {
@@ -196,12 +197,16 @@ struct Walker<'a> {
     budget: &'a Budget,
     emitted: usize,
     skipped: usize,
+    /// Node ids whose subtrees were not expanded, so a follow-up call can resume
+    /// from exactly there. Truncation without this is silent data loss.
+    unexpanded: Vec<String>,
 }
 
 impl Walker<'_> {
     fn walk(&mut self, node: &Node, depth: usize, out: &mut String) {
         if self.emitted >= self.budget.max_nodes {
             self.skipped += node.count();
+            self.unexpanded.push(node.id.clone());
             return;
         }
         line(node, depth, out);
@@ -212,18 +217,109 @@ impl Walker<'_> {
             if hidden > 0 {
                 let _ = writeln!(
                     out,
-                    "{}… {hidden} more node(s) below depth {}",
+                    "{}… {hidden} node(s) below depth {} — read_scene node_ids=[\"{}\"] to continue",
                     "  ".repeat(depth + 1),
-                    self.budget.max_depth
+                    self.budget.max_depth,
+                    node.id
                 );
                 self.skipped += hidden;
+                self.unexpanded.push(node.id.clone());
             }
             return;
         }
-        for c in &node.children {
-            self.walk(c, depth + 1, out);
+        self.walk_children(&node.children, depth + 1, out);
+    }
+
+    /// Walk siblings, collapsing consecutive runs that share a structure key.
+    ///
+    /// This is where most of the saving is, because real designs are repetitive:
+    /// lists, grids, and card decks are one shape repeated. Collapsing is also
+    /// *more* informative than repetition — "×50" states a fact about the design
+    /// that fifty near-identical lines leave the reader to infer.
+    fn walk_children(&mut self, children: &[Node], depth: usize, out: &mut String) {
+        let mut i = 0;
+        while i < children.len() {
+            let key = children[i].structure_key();
+            let mut j = i + 1;
+            while j < children.len() && children[j].structure_key() == key {
+                j += 1;
+            }
+            let run = &children[i..j];
+
+            if run.len() >= MIN_RUN {
+                self.emit_run(run, depth, out);
+            } else {
+                for c in run {
+                    self.walk(c, depth, out);
+                }
+            }
+            i = j;
         }
     }
+
+    fn emit_run(&mut self, run: &[Node], depth: usize, out: &mut String) {
+        if self.emitted >= self.budget.max_nodes {
+            self.skipped += run.iter().map(Node::count).sum::<usize>();
+            self.unexpanded.push(run[0].id.clone());
+            return;
+        }
+
+        let first = &run[0];
+        // The representative carries the shape; walking it once is enough.
+        line(first, depth, out);
+        self.emitted += 1;
+        if depth + 1 < self.budget.max_depth {
+            self.walk_children(&first.children, depth + 1, out);
+        }
+
+        let indent = "  ".repeat(depth + 1);
+        let _ = write!(
+            out,
+            "{indent}↳ ×{} siblings share this shape: {} … {}",
+            run.len(),
+            run[0].id,
+            run[run.len() - 1].id
+        );
+
+        // The varying text is the data half of the repeat — it is what a .map()
+        // would iterate, so it must not be lost to the collapse.
+        let mut varying: Vec<String> = Vec::new();
+        for node in run {
+            let t = node.text_content().join(" / ");
+            if !t.is_empty() {
+                varying.push(t);
+            }
+        }
+        varying.dedup();
+        if !varying.is_empty() {
+            let shown = varying.len().min(MAX_RUN_VALUES);
+            let quoted: Vec<String> = varying[..shown]
+                .iter()
+                .map(|v| format!("\"{}\"", elide(v, 40)))
+                .collect();
+            let _ = write!(out, "; content: {}", quoted.join(", "));
+            if varying.len() > shown {
+                let _ = write!(out, ", +{} more", varying.len() - shown);
+            }
+        }
+        out.push('\n');
+
+        // Siblings after the first are described, not skipped: nothing is lost.
+        self.emitted += run.len() - 1;
+    }
+}
+
+/// Below this, repetition is not worth collapsing.
+const MIN_RUN: usize = 3;
+/// Cap on distinct content values listed for one collapsed run.
+const MAX_RUN_VALUES: usize = 60;
+
+fn elide(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let head: String = s.chars().take(max - 1).collect();
+    format!("{head}…")
 }
 
 /// Render an outline for one or more roots.
@@ -234,18 +330,32 @@ pub fn render(roots: &[Node], budget: &Budget) -> String {
         budget,
         emitted: 0,
         skipped: 0,
+        unexpanded: Vec::new(),
     };
-    for r in roots {
-        w.walk(r, 0, &mut body);
-    }
+    // Roots are siblings too, so a page of similar frames collapses as well.
+    w.walk_children(roots, 0, &mut body);
 
     let mut out = format!("{total} node(s).\n\n{LEGEND}\n\n{body}");
     if w.skipped > 0 {
+        // Name the exact resume points. A count alone leaves the caller guessing
+        // what it did not see, which is how silent truncation becomes a wrong
+        // translation.
+        let ids: Vec<String> = w
+            .unexpanded
+            .iter()
+            .take(20)
+            .map(|i| format!("\"{i}\""))
+            .collect();
         let _ = write!(
             out,
-            "\n{} node(s) not shown. Raise max_nodes/depth, or call read_scene \
-             with detail=\"full\" and the node_ids you care about.\n",
-            w.skipped
+            "\n{} node(s) not expanded. Nothing is lost — continue with:\n               read_scene node_ids=[{}]{}\n",
+            w.skipped,
+            ids.join(", "),
+            if w.unexpanded.len() > 20 {
+                format!(" (+{} more resume points)", w.unexpanded.len() - 20)
+            } else {
+                String::new()
+            }
         );
     }
     out
@@ -332,11 +442,93 @@ mod tests {
     }
 
     #[test]
-    fn a_node_budget_truncates_and_says_so() {
+    fn repeated_siblings_collapse_to_one_shape_plus_their_content() {
         let mut root = scene();
-        // 40 siblings, budget of 5.
         let child = root.children[0].clone();
-        root.children = std::iter::repeat_n(child, 40).collect();
+        // 40 rows that differ only in their text, as a real list does.
+        root.children = (0..40)
+            .map(|i| {
+                let mut c = child.clone();
+                c.id = format!("1:{}", 100 + i);
+                if let Some(t) = &mut c.text {
+                    t.content = format!("Row {i}");
+                }
+                c
+            })
+            .collect();
+
+        let out = render(&[root], &Budget::default());
+
+        // One representative line, not forty.
+        let label_lines = out.lines().filter(|l| l.contains("· TEXT ")).count();
+        assert_eq!(label_lines, 1, "the shape should appear once:\n{out}");
+
+        // But the run, its id range and all of its content survive.
+        assert!(out.contains("×40 siblings share this shape"), "{out}");
+        assert!(
+            out.contains("1:100 … 1:139"),
+            "id range must be stated:\n{out}"
+        );
+        assert!(out.contains("\"Row 0\""), "{out}");
+        assert!(
+            out.contains("\"Row 39\""),
+            "no content may be dropped:\n{out}"
+        );
+        assert!(
+            !out.contains("not expanded"),
+            "collapsing is not truncation:\n{out}"
+        );
+    }
+
+    #[test]
+    fn distinct_siblings_are_not_collapsed() {
+        let mut root = scene();
+        let child = root.children[0].clone();
+        root.children = (0..4)
+            .map(|i| {
+                let mut c = child.clone();
+                c.id = format!("1:{}", 200 + i);
+                // Different sizing makes each one a different shape.
+                c.placement = Placement::InFlow {
+                    width: Sizing::Fixed(40.0 * (i + 1) as f64),
+                    height: Sizing::Hug,
+                    align_self: None,
+                };
+                c
+            })
+            .collect();
+
+        let out = render(&[root], &Budget::default());
+        assert!(
+            !out.contains("share this shape"),
+            "distinct shapes must not merge:\n{out}"
+        );
+        for i in 200..204 {
+            assert!(
+                out.contains(&format!("1:{i}")),
+                "node 1:{i} missing:\n{out}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_node_budget_names_exact_resume_points() {
+        let mut root = scene();
+        let child = root.children[0].clone();
+        // Structurally distinct children, so collapsing cannot absorb them.
+        root.children = (0..30)
+            .map(|i| {
+                let mut c = child.clone();
+                c.id = format!("1:{}", 300 + i);
+                c.padding = crate::ir::Edges {
+                    top: i as f64,
+                    right: 0.0,
+                    bottom: 0.0,
+                    left: 0.0,
+                };
+                c
+            })
+            .collect();
 
         let out = render(
             &[root],
@@ -345,13 +537,15 @@ mod tests {
                 max_depth: 12,
             },
         );
-        assert!(out.contains("not shown"), "must admit truncation:\n{out}");
         assert!(
-            out.contains("detail=\"full\""),
-            "must say how to get more:\n{out}"
+            out.contains("not expanded"),
+            "must admit what it did not walk:\n{out}"
         );
-        let shown = out.lines().filter(|l| l.contains("1:2 Label")).count();
-        assert!(shown <= 5, "emitted {shown} nodes despite a budget of 5");
+        assert!(
+            out.contains("read_scene node_ids=["),
+            "must name resume points, not just a count:\n{out}"
+        );
+        assert!(out.contains("Nothing is lost"), "{out}");
     }
 
     #[test]

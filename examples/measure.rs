@@ -140,8 +140,6 @@ fn main() {
         "outline vs full-pretty: {:.0}x cheaper",
         pretty.len() as f64 / outline.len() as f64
     );
-    println!("\n--- sample outline lines ---");
-    for l in outline.lines().skip(7).take(5) {
-        println!("{l}");
-    }
+    println!("\n--- the entire outline ---");
+    println!("{outline}");
 }

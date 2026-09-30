@@ -336,6 +336,111 @@ impl Node {
         )
     }
 
+    /// A hash of this subtree's *shape*, ignoring identity and content.
+    ///
+    /// Two nodes share a key when they would generate the same markup and CSS —
+    /// same type, same layout, same sizing, same paint, same child structure —
+    /// even though their ids, names, positions and text differ.
+    ///
+    /// This is what makes a 50-row list cheap to describe and correct to
+    /// generate: the rows collapse to one shape plus its data, which is what a
+    /// `.map()` is. It is deliberately content-blind, because the content is the
+    /// part that varies.
+    pub fn structure_key(&self) -> u64 {
+        use std::hash::Hasher;
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.hash_structure(&mut h);
+        h.finish()
+    }
+
+    fn hash_structure<H: std::hash::Hasher>(&self, h: &mut H) {
+        use std::hash::Hash;
+        self.kind.hash(h);
+        // Layout and placement decide the markup; round sizes so a sub-pixel
+        // difference between otherwise identical rows does not split the group.
+        format!("{:?}", self.layout).hash(h);
+        match &self.placement {
+            Placement::InFlow {
+                width,
+                height,
+                align_self,
+            } => {
+                "inflow".hash(h);
+                format!("{width:?}{height:?}{align_self:?}").hash(h);
+            }
+            Placement::Absolute {
+                width,
+                height,
+                anchor_h,
+                anchor_v,
+                ..
+            } => {
+                // Position is excluded: absolutely placed siblings are still the
+                // same shape, which is exactly the repeated-card case.
+                "abs".hash(h);
+                format!("{width:?}{height:?}{anchor_h:?}{anchor_v:?}").hash(h);
+            }
+        }
+        format!("{:?}", self.padding).hash(h);
+        format!("{:?}", self.style).hash(h);
+        // Text styling is structural; the characters are not.
+        if let Some(t) = &self.text {
+            format!(
+                "{:?}{:?}{:?}{:?}",
+                t.font_family, t.font_size, t.font_weight, t.align
+            )
+            .hash(h);
+        }
+        // A component instance's identity and variant are structural.
+        if let Some(i) = &self.instance {
+            i.component.hash(h);
+            format!("{:?}", i.props).hash(h);
+        }
+        self.interactions.len().hash(h);
+        self.children.len().hash(h);
+        for c in &self.children {
+            c.hash_structure(h);
+        }
+    }
+
+    /// The text content of this subtree, in document order.
+    ///
+    /// Paired with [`Node::structure_key`], this is the data half of a repeated
+    /// group: same shape, different strings.
+    pub fn text_content(&self) -> Vec<&str> {
+        let mut out = Vec::new();
+        self.collect_text(&mut out);
+        out
+    }
+
+    fn collect_text<'a>(&'a self, out: &mut Vec<&'a str>) {
+        if let Some(t) = &self.text {
+            out.push(t.content.as_str());
+        }
+        for c in &self.children {
+            c.collect_text(out);
+        }
+    }
+
+    /// The text-bearing nodes of this subtree, as (layer name, content) pairs.
+    ///
+    /// Layer names become the field names of a repeated run's data array, which
+    /// is why they are carried alongside the content.
+    pub fn text_slots(&self) -> Vec<(&str, &str)> {
+        let mut out = Vec::new();
+        self.collect_slots(&mut out);
+        out
+    }
+
+    fn collect_slots<'a>(&'a self, out: &mut Vec<(&'a str, &'a str)>) {
+        if let Some(t) = &self.text {
+            out.push((self.name.as_str(), t.content.as_str()));
+        }
+        for c in &self.children {
+            c.collect_slots(out);
+        }
+    }
+
     /// Does this subtree declare any prototype interaction?
     pub fn has_interactions(&self) -> bool {
         !self.interactions.is_empty() || self.children.iter().any(Node::has_interactions)
@@ -872,5 +977,87 @@ mod tests {
         let node = build(&parent);
         assert_eq!(node.children.len(), 1);
         assert_eq!(node.children[0].id, "b");
+    }
+}
+
+#[cfg(test)]
+mod structure_tests {
+    use super::*;
+    use crate::raw::{RawNode, RawRect, RawText};
+
+    fn row(id: &str, label: &str, width: f64) -> RawNode {
+        RawNode {
+            id: id.into(),
+            name: format!("Row {id}"),
+            kind: "FRAME".into(),
+            visible: true,
+            absolute_bounding_box: Some(RawRect {
+                x: 0.0,
+                y: 0.0,
+                width,
+                height: 48.0,
+            }),
+            layout_mode: Some("HORIZONTAL".into()),
+            item_spacing: Some(8.0),
+            layout_sizing_horizontal: Some("FILL".into()),
+            children: vec![RawNode {
+                id: format!("{id}a"),
+                name: "Label".into(),
+                kind: "TEXT".into(),
+                visible: true,
+                text: Some(RawText {
+                    characters: label.into(),
+                    font_size: Some(14.0),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn rows_differing_only_in_text_share_a_structure_key() {
+        let a = build(&row("1:1", "Wi-Fi", 280.0));
+        let b = build(&row("1:2", "Bluetooth", 280.0));
+        assert_eq!(
+            a.structure_key(),
+            b.structure_key(),
+            "ids, names and text must not affect the shape"
+        );
+    }
+
+    #[test]
+    fn a_different_shape_gets_a_different_key() {
+        let a = build(&row("1:1", "Wi-Fi", 280.0));
+        let mut different = row("1:2", "Bluetooth", 280.0);
+        different.layout_mode = Some("VERTICAL".into());
+        let b = build(&different);
+        assert_ne!(a.structure_key(), b.structure_key(), "layout is structural");
+
+        let mut resized = row("1:3", "Wi-Fi", 280.0);
+        resized.layout_sizing_horizontal = Some("HUG".into());
+        assert_ne!(
+            a.structure_key(),
+            build(&resized).structure_key(),
+            "sizing is structural"
+        );
+    }
+
+    #[test]
+    fn text_content_is_collected_in_document_order() {
+        let mut parent = row("1:1", "First", 280.0);
+        parent.children.push(RawNode {
+            id: "1:1b".into(),
+            kind: "TEXT".into(),
+            visible: true,
+            text: Some(RawText {
+                characters: "Second".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let node = build(&parent);
+        assert_eq!(node.text_content(), vec!["First", "Second"]);
     }
 }

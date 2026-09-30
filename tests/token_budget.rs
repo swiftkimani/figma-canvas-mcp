@@ -133,22 +133,31 @@ fn the_default_read_of_a_real_screen_fits_a_small_context() {
         "the default read_scene costs ~{t} tokens for 151 nodes; budget is 4000"
     );
 
-    // Cheapness must not mean uselessness: ids, nesting and semantics survive.
+    // Cheapness must not mean loss. The 50 rows are one shape, so they collapse —
+    // but every fact needed to translate them accurately has to survive.
+    assert!(out.contains("×50 siblings share this shape"), "{out}");
     assert!(
-        out.contains("10:27"),
-        "node ids must survive: a follow-up needs them"
+        out.contains("10:0 … 10:49"),
+        "the id range must be stated so a follow-up can address any row:\n{out}"
     );
     assert!(out.contains("w:fill"), "FILL sizing must survive");
     assert!(
         out.contains("bg:color/surface/subtle"),
         "token names must survive"
     );
-    assert!(
-        out.contains("\"Item number 27\""),
-        "text content must survive"
-    );
+    // All fifty content values, not a sample: this is the data a .map() renders.
+    for i in [0usize, 27, 49] {
+        assert!(
+            out.contains(&format!("\"Item number {i}\"")),
+            "content for row {i} was dropped:\n{out}"
+        );
+    }
     assert!(out.contains("→export"), "vectors must be flagged");
     assert!(out.contains("    "), "nesting must survive");
+    assert!(
+        !out.contains("not expanded"),
+        "collapsing a repeat is not truncation; nothing should be withheld:\n{out}"
+    );
 }
 
 #[test]
@@ -202,12 +211,42 @@ fn a_huge_frame_still_cannot_blow_the_window() {
     let t = tokens(out.len());
     assert!(
         t < 8_000,
-        "a 1500-node frame produced ~{t} tokens; the node budget is not capping it"
+        "a 1500-node frame produced ~{t} tokens; nothing is capping it"
     );
+    // Repetition, not truncation, is what absorbs scale here — so a 10x larger
+    // design costs barely more and still loses nothing.
     assert!(
-        out.contains("not shown"),
-        "truncation must be declared:\n{}",
-        &out[..400]
+        !out.contains("not expanded"),
+        "a repetitive frame should collapse, not truncate:\n{}",
+        &out[..600]
+    );
+    assert!(out.contains("siblings share this shape"), "{}", &out[..600]);
+    assert!(
+        out.contains("1501 node(s)"),
+        "the true total must be reported"
+    );
+}
+
+#[test]
+fn cost_barely_grows_when_a_design_grows() {
+    // The property that matters for "no matter how many frames": a design that
+    // is 10x bigger but no more varied must not cost 10x more to read.
+    let small = realistic_screen();
+    let mut large = realistic_screen();
+    let rows = large.children.clone();
+    for _ in 0..9 {
+        large.children.extend(rows.iter().cloned());
+    }
+
+    let a = outline::render(std::slice::from_ref(&small), &Budget::default()).len();
+    let b = outline::render(std::slice::from_ref(&large), &Budget::default()).len();
+
+    let node_growth = large.count() as f64 / small.count() as f64;
+    let cost_growth = b as f64 / a as f64;
+    assert!(
+        cost_growth < node_growth / 2.0,
+        "nodes grew {node_growth:.1}x but cost grew {cost_growth:.1}x; \
+         repetition is not being absorbed"
     );
 }
 

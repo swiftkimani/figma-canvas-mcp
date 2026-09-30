@@ -4,6 +4,7 @@
 //! not, or does worse. Tools return pretty JSON or source text, because that is
 //! what a model actually reads.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use base64::Engine as _;
@@ -71,6 +72,14 @@ pub struct ReadSceneArgs {
     /// Also fetch Figma's own getCSSAsync() per node. Exact, but much larger.
     #[serde(default)]
     pub include_css: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct TokensArgs {
+    /// Above this many tokens the JSON listing is summarised by collection, with
+    /// the full values left to tokens.css. Default 80.
+    #[serde(default)]
+    pub max: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -263,9 +272,28 @@ impl FigmaServer {
                        pair it with read_scene for layout."
     )]
     async fn get_css(&self, Parameters(args): Parameters<NodesArgs>) -> Result<String, ErrorData> {
-        let params = self.nodes_param(args.node_ids).await;
+        // Figma's CSS is verbose per node, so this is deliberately not a tool to
+        // point at a whole page. Cap it and say so rather than flooding the caller.
+        const MAX_CSS_NODES: usize = 40;
+        let requested = args.node_ids.as_ref().map(|v| v.len()).unwrap_or(0);
+        let (ids, trimmed) = match args.node_ids {
+            Some(v) if v.len() > MAX_CSS_NODES => {
+                let kept = v[..MAX_CSS_NODES].to_vec();
+                (Some(kept), requested - MAX_CSS_NODES)
+            }
+            other => (other, 0),
+        };
+
+        let params = self.nodes_param(ids).await;
         let v = self.bridge.call("css", params).await?;
-        pretty(&v)
+        let body = pretty(&v)?;
+        if trimmed > 0 {
+            return Ok(format!(
+                "Returned the first {MAX_CSS_NODES} nodes; {trimmed} more were not \
+                 requested from Figma. Call again with the remaining node_ids.\n\n{body}"
+            ));
+        }
+        Ok(body)
     }
 
     /// Variables with their names — the thing REST gates behind Enterprise.
@@ -275,7 +303,10 @@ impl FigmaServer {
                        tokens.css. The Plugin API exposes these on any plan, unlike the REST \
                        variables endpoints."
     )]
-    async fn get_tokens(&self) -> Result<String, ErrorData> {
+    async fn get_tokens(
+        &self,
+        Parameters(args): Parameters<TokensArgs>,
+    ) -> Result<String, ErrorData> {
         let tokens = self.tokens().await?;
         if tokens.is_empty() {
             return Ok(
@@ -318,6 +349,41 @@ impl FigmaServer {
             .find(|f| f.path == "tokens.css")
             .map(|f| f.contents.clone())
             .unwrap_or_default();
+
+        // A mature design system has hundreds of variables, and the stylesheet
+        // already carries every value. Listing the JSON too doubles the cost for
+        // nothing, so past a threshold we summarise and let the sheet speak.
+        let limit = args.max.unwrap_or(80) as usize;
+        if tokens.len() > limit {
+            let mut by_collection: BTreeMap<String, Vec<&Token>> = BTreeMap::new();
+            for t in &tokens {
+                by_collection
+                    .entry(t.collection.clone().unwrap_or_else(|| "(none)".into()))
+                    .or_default()
+                    .push(t);
+            }
+            let mut out = format!(
+                "{} tokens across {} collection(s). Listing summarised to keep the \
+                 response small; every value is in tokens.css below.\n\n",
+                tokens.len(),
+                by_collection.len()
+            );
+            for (name, items) in &by_collection {
+                let names: Vec<&str> = items.iter().take(12).map(|t| t.name.as_str()).collect();
+                out.push_str(&format!(
+                    "{name}: {} token(s) — {}{}\n",
+                    items.len(),
+                    names.join(", "),
+                    if items.len() > names.len() {
+                        format!(", +{} more", items.len() - names.len())
+                    } else {
+                        String::new()
+                    }
+                ));
+            }
+            out.push_str(&format!("\n--- tokens.css ---\n{sheet}"));
+            return Ok(out);
+        }
 
         Ok(format!(
             "{}\n\n--- tokens.css ---\n{}",

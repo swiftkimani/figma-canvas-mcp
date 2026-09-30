@@ -143,11 +143,11 @@ Two rules drive this:
    `className`, because placement is the caller's decision while paint is the
    component's.
 
-## Token cost
+## Token cost, and why size stops mattering
 
 Designed for small context windows, because most people are not on a large one.
-A free-tier model, OpenCode, or a local model has a window this tool can exhaust
-in a single careless call — so it does not make careless calls.
+A free-tier model, OpenCode, or a local model has a window this tool could
+exhaust in a single careless call — so it does not make careless calls.
 
 Measured on an ordinary 151-node screen (a 50-row settings list):
 
@@ -156,39 +156,86 @@ Measured on an ordinary 151-node screen (a 50-row settings list):
 | naive full tree, pretty-printed | ~55,600 |
 | after dropping empty fields | ~28,800 |
 | compact JSON | ~13,300 |
-| **outline — the default** | **~2,760** |
+| **outline — the default** | **~392** |
 
-A 20× reduction, and the outline still carries every node id, the nesting, sizing,
-token names and text, so drilling into one branch is one cheap follow-up call.
+**142× cheaper**, with nothing lost: all 50 rows' content is still there.
 
-Three things get it there:
+### The idea that does most of the work
 
-1. **Progressive disclosure.** `read_scene` defaults to `detail="outline"` — one
-   line per node. `detail="full"` exists for a subtree you have already chosen,
-   and warns when you point it at something large.
-   ```
-   1:1 Settings list · FRAME 320×800 · col gap12 p16
-     10:0 Row item 0 · FRAME 280×48 · row gap8 between/center p8,12 · w:fill h:hug · bg:color/surface/subtle
-       10:0a Label · TEXT 120×20 · "Item number 0"
-       10:0b Chevron · VECTOR 16×16 · →export
-   ```
-2. **Nothing empty is serialized.** A 151-node tree was emitting ~1,400 `null`
-   fields, 654 empty arrays and 151 empty objects. Now none.
-3. **Hard budgets with honest truncation.** `max_nodes` (300) and `depth` cap the
-   output, and the result says how many nodes it omitted and how to get them.
-   A 1,500-node frame still returns under 8k tokens.
+Real designs are repetitive. A 50-row list is one shape repeated fifty times,
+differing only in text. So every node gets a **structure key** — a hash of its
+shape (type, layout, sizing, paint, child structure) that deliberately ignores
+ids, names, positions and content. Consecutive siblings sharing a key collapse:
 
-Other costs, deliberately kept down:
+```
+10:0 Row item 0 · FRAME 280×48 · row gap8 between/center p8,12 · w:fill h:hug · bg:color/surface/subtle
+  10:0a Label · TEXT 120×20 · "Item number 0"
+  10:0b Chevron · VECTOR 16×16 · →export
+  ↳ ×50 siblings share this shape: 10:0 … 10:49; content: "Item number 0", "Item number 1", … all 50
+```
 
+Four lines instead of a hundred and fifty. The id range is stated, so any row is
+still addressable, and every content value survives, because that is the data.
+
+**This improves accuracy, not just cost.** The same grouping drives codegen, so a
+repeated run becomes a `.map()` — which is what the designer meant and what a
+developer would have written:
+
+```tsx
+{[
+  { label: "Wi-Fi", value: "On" },
+  { label: "Bluetooth", value: "Off" },
+  { label: "Airplane mode", value: "Off" },
+].map((item, i) => (
+  <div key={i} className={styles.row}>
+    <p className={styles.label}>{item.label}</p>
+    <p className={styles.value}>{item.value}</p>
+  </div>
+))}
+```
+
+One template, one CSS rule per shape. Field names come from the Figma layer
+names, so the data reads like the design. When the content does not line up —
+one row has an extra text node — it falls back to literal copies rather than
+inventing a template that does not fit.
+
+### No matter how big the design
+
+The property that matters: a design ten times larger but no more *varied* costs
+barely more to read. `tests/token_budget.rs` asserts exactly that — node count can
+grow 10× while output grows less than half as fast. A 1,501-node frame collapses
+rather than truncating, and still reports its true total.
+
+When something genuinely cannot be collapsed, the outline does **not** silently
+truncate. It names the exact resume points:
+
+```
+412 node(s) not expanded. Nothing is lost — continue with:
+  read_scene node_ids=["3:88", "3:91", "4:12"]
+```
+
+Silent truncation is how a cheap read becomes a wrong translation, so nothing is
+dropped without saying which ids to ask for next. For a page of many *different*
+frames, read it at a shallow depth to get the frame list, then work one frame at
+a time — frames are the natural unit, and cost stays flat per frame however many
+there are.
+
+### Everything else that costs
+
+- **Nothing empty is serialized.** That tree was emitting ~1,400 `null` fields,
+  654 empty arrays and 151 empty objects. Now none.
 - **The per-request floor is ~1,500 tokens** for the instructions plus all nine
   tool schemas. That ships with every request, so it is budgeted and tested.
-- **`getCSSAsync()` roughly triples the payload**, so it is opt-in, and it is
-  ignored in outline mode rather than silently paid for.
+- **`getCSSAsync()` roughly triples the payload**, so it is opt-in and is ignored
+  in outline mode rather than silently paid for.
+- **`get_tokens` summarises by collection** past 80 variables, since `tokens.css`
+  already carries every value.
+- **`get_css` caps at 40 nodes** and says how many it did not fetch.
 - **`generate_code` needs no `read_scene` first.** One call, not two.
-- **JSON is compacted above 2 KB**, where indentation stops being worth its bytes.
+- **JSON compacts above 2 KB**, where indentation stops earning its bytes.
 
-All of this is enforced by `tests/token_budget.rs`, so a change that reintroduces
-a verbose default fails CI rather than quietly costing someone their window.
+All enforced by `tests/token_budget.rs`, so a change that reintroduces a verbose
+default fails CI rather than quietly costing someone their window.
 
 ## Motion
 
@@ -289,7 +336,7 @@ WebSockets — use Figma Desktop there, or terminate TLS locally.
 ## Development
 
 ```bash
-cargo test                                      # 49 tests
+cargo test                                      # 62 tests
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all --check
 node --check plugin/code.js                     # syntax only; not a dependency
@@ -299,11 +346,11 @@ Four layers of test, all run by CI on Linux, macOS and Windows:
 
 | Suite | What it covers |
 |---|---|
-| unit (31) | The layout mapping, codegen rules, and motion — including a test that fails if `getCSSAsync()` ever overrides the IR's layout, and one asserting an underdamped spring actually overshoots while an overdamped one does not |
+| unit (39) | The layout mapping, codegen rules, and motion — including a test that fails if `getCSSAsync()` ever overrides the IR's layout, and one asserting an underdamped spring actually overshoots while an overdamped one does not |
 | `tests/bridge_roundtrip.rs` (7) | The real WebSocket server driven by a fake plugin — wire protocol, IR, motion and codegen end to end, without Figma |
 | `tests/plugin_consistency.rs` (7) | Rust/plugin drift: port agreement across `main.rs`, `manifest.json` and `ui.html`; every op the server calls exists in the plugin and none are dead; no synchronous Figma APIs under `documentAccess: dynamic-page` |
 | `tests/mcp_stdio.rs` (3) | A real `initialize` / `tools/list` / `tools/call` handshake against the compiled binary, asserting stdout is clean JSON-RPC |
-| `tests/token_budget.rs` (5) | Enforced token budgets on a realistic 151-node screen, plus the per-request schema floor |
+| `tests/token_budget.rs` (6) | Enforced token budgets on a realistic 151-node screen, that cost grows sub-linearly with design size, and the per-request schema floor |
 
 The drift guards exist because those mismatches fail *silently at runtime* — a
 stale port is a socket that never opens, and Figma reports a plugin syntax error as

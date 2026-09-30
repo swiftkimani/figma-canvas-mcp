@@ -60,8 +60,16 @@ struct Handler {
     doc: String,
 }
 
+/// While emitting a repeated run's template, text nodes render an expression
+/// (`{item.label}`) instead of their literal content.
+struct Substitution {
+    exprs: Vec<String>,
+    next: usize,
+}
+
 struct Ctx {
     mode: StyleMode,
+    subst: Option<Substitution>,
     /// Emitted rules, in order.
     rules: Vec<Rule>,
     handlers: Vec<Handler>,
@@ -98,6 +106,7 @@ pub fn generate(
 
     let mut ctx = Ctx {
         mode,
+        subst: None,
         rules: Vec::new(),
         handlers: Vec::new(),
         used: HashMap::new(),
@@ -498,8 +507,16 @@ fn emit(
 
     // 3. Pure text.
     if node.is_text_only() {
-        let text = node.text.as_ref().map(|t| t.content.as_str()).unwrap_or("");
         let tag = text_tag(node);
+        // Inside a repeated run, the content is data, not a literal.
+        if let Some(sub) = &mut ctx.subst
+            && sub.next < sub.exprs.len()
+        {
+            let expr = sub.exprs[sub.next].clone();
+            sub.next += 1;
+            return format!("{pad}<{tag}{attr}>{{{expr}}}</{tag}>");
+        }
+        let text = node.text.as_ref().map(|t| t.content.as_str()).unwrap_or("");
         return format!("{pad}<{tag}{attr}>{}</{tag}>", escape_text(text));
     }
 
@@ -508,13 +525,132 @@ fn emit(
         return format!("{pad}<div{attr} />");
     }
 
-    let inner: Vec<String> = node
-        .children
-        .iter()
-        .map(|c| emit(c, Some(&node.layout), ctx, indent + 1, false))
-        .collect();
+    let inner = emit_children(&node.children, Some(&node.layout), ctx, indent + 1);
 
-    format!("{pad}<div{attr}>\n{}\n{pad}</div>", inner.join("\n"))
+    format!("{pad}<div{attr}>\n{inner}\n{pad}</div>")
+}
+
+/// Walk siblings, rendering consecutive same-shape runs as a single `.map()`.
+///
+/// A design with fifty identical rows should produce one template and a data
+/// array, not fifty copies. That is better code, it is what the designer meant,
+/// and it is what stops output size scaling with the size of the design.
+fn emit_children(
+    children: &[Node],
+    parent: Option<&Layout>,
+    ctx: &mut Ctx,
+    indent: usize,
+) -> String {
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < children.len() {
+        let key = children[i].structure_key();
+        let mut j = i + 1;
+        while j < children.len() && children[j].structure_key() == key {
+            j += 1;
+        }
+        let run = &children[i..j];
+
+        let collapsed = if run.len() >= MIN_RUN {
+            emit_run(run, parent, ctx, indent)
+        } else {
+            None
+        };
+        match collapsed {
+            Some(rendered) => out.push(rendered),
+            None => {
+                for c in run {
+                    out.push(emit(c, parent, ctx, indent, false));
+                }
+            }
+        }
+        i = j;
+    }
+    out.join("\n")
+}
+
+/// Repeated siblings below this count are not worth a `.map()`.
+const MIN_RUN: usize = 3;
+
+/// Render a run as a data array plus a map, or `None` when the content does not
+/// line up cleanly and literal copies are the honest output.
+fn emit_run(run: &[Node], parent: Option<&Layout>, ctx: &mut Ctx, indent: usize) -> Option<String> {
+    let slots: Vec<Vec<(&str, &str)>> = run.iter().map(|n| n.text_slots()).collect();
+    let width = slots[0].len();
+    // Uneven content means these are not really one template.
+    if width == 0 || slots.iter().any(|s| s.len() != width) {
+        return None;
+    }
+
+    let pad = "  ".repeat(indent);
+    let field_names = unique_fields(&slots[0]);
+
+    // One text slot maps over plain strings; several map over objects.
+    let (data, exprs, param) = if width == 1 {
+        let values: Vec<String> = slots
+            .iter()
+            .map(|s| format!("{pad}    {}", js_string(s[0].1)))
+            .collect();
+        let param = field_names[0].clone();
+        (values, vec![param.clone()], param)
+    } else {
+        let rows: Vec<String> = slots
+            .iter()
+            .map(|s| {
+                let fields: Vec<String> = s
+                    .iter()
+                    .zip(&field_names)
+                    .map(|((_, v), name)| format!("{name}: {}", js_string(v)))
+                    .collect();
+                format!("{pad}    {{ {} }}", fields.join(", "))
+            })
+            .collect();
+        let exprs = field_names.iter().map(|f| format!("item.{f}")).collect();
+        (rows, exprs, "item".to_string())
+    };
+
+    // Render the first item as the template, its content replaced by the data.
+    let previous = ctx.subst.replace(Substitution { exprs, next: 0 });
+    let template = emit(&run[0], parent, ctx, indent + 1, false);
+    ctx.subst = previous;
+
+    Some(format!(
+        "{pad}{{[\n{}\n{pad}  ].map(({param}, i) => (\n{}\n{pad}  ))}}",
+        data.join(",\n"),
+        add_key(&template)
+    ))
+}
+
+/// Field names from layer names, made unique and JS-safe.
+fn unique_fields(slots: &[(&str, &str)]) -> Vec<String> {
+    let mut used: HashMap<String, usize> = HashMap::new();
+    slots
+        .iter()
+        .map(|(name, _)| {
+            let c = camel_case(&kebab_case(name));
+            let base = if c.is_empty() || c.starts_with(|ch: char| ch.is_ascii_digit()) {
+                format!("field{c}")
+            } else {
+                c
+            };
+            let n = used.entry(base.clone()).or_insert(0);
+            *n += 1;
+            if *n == 1 { base } else { format!("{base}{n}") }
+        })
+        .collect()
+}
+
+/// React needs a key on mapped elements; the index is the honest default when
+/// the design gives us no stable id.
+fn add_key(template: &str) -> String {
+    match template.find([' ', '>', '/']) {
+        Some(pos) => format!("{} key={{i}}{}", &template[..pos], &template[pos..]),
+        None => template.to_string(),
+    }
+}
+
+fn js_string(s: &str) -> String {
+    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 /// Guess a semantic tag from the layer name and type size.
@@ -860,6 +996,96 @@ mod tests {
         assert!(tsx.contains("gap-2"), "8px maps to Tailwind's 2 step");
         // box-shadow has no clean utility, so it must survive in CSS.
         assert!(g.files.iter().any(|f| f.contents.contains("box-shadow")));
+    }
+
+    fn labelled_row(id: &str, label: &str, value: &str) -> Node {
+        let mut row = frame(&format!("Row {id}"), vec![]);
+        row.id = id.into();
+        let mut a = text_node("Label", label, 14.0);
+        a.id = format!("{id}a");
+        let mut b = text_node("Value", value, 14.0);
+        b.id = format!("{id}b");
+        row.children = vec![a, b];
+        row
+    }
+
+    #[test]
+    fn repeated_rows_become_a_map_not_copies() {
+        let rows: Vec<Node> = vec![
+            labelled_row("1", "Wi-Fi", "On"),
+            labelled_row("2", "Bluetooth", "Off"),
+            labelled_row("3", "Airplane mode", "Off"),
+            labelled_row("4", "Hotspot", "On"),
+        ];
+        let g = generate(&frame("Settings", rows), &[], StyleMode::CssModules, None);
+        let tsx = &g.files[0].contents;
+
+        assert!(
+            tsx.contains(".map((item, i) => ("),
+            "expected a map:\n{tsx}"
+        );
+        assert!(
+            tsx.contains("key={i}"),
+            "mapped elements need a key:\n{tsx}"
+        );
+        // Field names come from the layer names, so the data reads like the design.
+        assert!(tsx.contains("{ label: \"Wi-Fi\", value: \"On\" }"), "{tsx}");
+        assert!(
+            tsx.contains("{ label: \"Hotspot\", value: \"On\" }"),
+            "{tsx}"
+        );
+        assert!(tsx.contains("{item.label}"), "{tsx}");
+        assert!(tsx.contains("{item.value}"), "{tsx}");
+
+        // One template, not four copies.
+        assert_eq!(
+            tsx.matches("className={styles.label}").count(),
+            1,
+            "the row should be emitted once:\n{tsx}"
+        );
+        // And one CSS rule per shape, not per instance.
+        let sheet = &g.files[1].contents;
+        assert_eq!(sheet.matches(".label {").count(), 1, "{sheet}");
+    }
+
+    #[test]
+    fn a_single_text_slot_maps_over_plain_strings() {
+        let rows: Vec<Node> = (0..4)
+            .map(|i| {
+                let mut r = frame(&format!("Row {i}"), vec![]);
+                r.id = format!("r{i}");
+                let mut t = text_node("Title", &format!("Item {i}"), 14.0);
+                t.id = format!("r{i}t");
+                r.children = vec![t];
+                r
+            })
+            .collect();
+        let g = generate(&frame("List", rows), &[], StyleMode::CssModules, None);
+        let tsx = &g.files[0].contents;
+        assert!(tsx.contains(".map((title, i) => ("), "{tsx}");
+        assert!(tsx.contains("\"Item 0\""), "{tsx}");
+        assert!(tsx.contains("{title}"), "{tsx}");
+        assert!(!tsx.contains("item."), "one slot needs no object:\n{tsx}");
+    }
+
+    #[test]
+    fn uneven_content_falls_back_to_literal_copies() {
+        // Same shape by structure, but one row has an extra text node, so the
+        // template does not actually fit. Copies are the honest answer.
+        let mut odd = labelled_row("3", "Airplane mode", "Off");
+        odd.children.push(text_node("Extra", "Beta", 14.0));
+        let rows = vec![
+            labelled_row("1", "Wi-Fi", "On"),
+            labelled_row("2", "Bluetooth", "Off"),
+            odd,
+        ];
+        let g = generate(&frame("Settings", rows), &[], StyleMode::CssModules, None);
+        let tsx = &g.files[0].contents;
+        assert!(tsx.contains("Wi-Fi"), "{tsx}");
+        assert!(
+            tsx.contains("Beta"),
+            "no content may be lost in the fallback:\n{tsx}"
+        );
     }
 
     #[test]

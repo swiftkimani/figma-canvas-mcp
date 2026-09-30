@@ -4,7 +4,7 @@
 //! WebSocket that a small Figma plugin connects to. No Figma API token, no REST
 //! rate limit, no Node.js runtime.
 
-use figma_canvas_mcp::{DEFAULT_BRIDGE_PORT, bridge, tools};
+use figma_canvas_mcp::{DEFAULT_BRIDGE_PORT, bridge, doctor, tools};
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -16,6 +16,12 @@ figma-canvas-mcp — read a live Figma canvas over a local plugin bridge
 
 USAGE:
     figma-canvas-mcp [OPTIONS]
+    figma-canvas-mcp doctor [OPTIONS]
+
+COMMANDS:
+    doctor                     Check the port, the plugin, the detected project,
+                               the language server and the output directory, then
+                               print the client config to copy. Run this first.
 
 The server speaks MCP on stdin/stdout, so it is normally launched by an MCP
 client rather than run by hand. Logs go to stderr.
@@ -35,6 +41,7 @@ The bind address stays on loopback by design: the plugin runs on this machine.
 ";
 
 struct Args {
+    doctor: bool,
     host: String,
     port: u16,
     out_dir: PathBuf,
@@ -45,6 +52,7 @@ struct Args {
 impl Default for Args {
     fn default() -> Self {
         Self {
+            doctor: false,
             host: "127.0.0.1".into(),
             port: DEFAULT_BRIDGE_PORT,
             out_dir: PathBuf::from("figma-out"),
@@ -56,7 +64,11 @@ impl Default for Args {
 
 fn parse_args() -> Result<Args, String> {
     let mut args = Args::default();
-    let mut it = std::env::args().skip(1);
+    let mut it = std::env::args().skip(1).peekable();
+    if it.peek().map(|a| a == "doctor").unwrap_or(false) {
+        it.next();
+        args.doctor = true;
+    }
     while let Some(flag) = it.next() {
         let mut value = || it.next().ok_or_else(|| format!("{flag} expects a value"));
         match flag.as_str() {
@@ -108,6 +120,17 @@ async fn main() -> anyhow::Result<()> {
         )
         .with_ansi(false)
         .init();
+
+    if args.doctor {
+        let ok = doctor::run(&doctor::Options {
+            host: args.host.clone(),
+            port: args.port,
+            out_dir: args.out_dir.clone(),
+            project_root: args.project_root.clone(),
+        })
+        .await;
+        std::process::exit(if ok { 0 } else { 1 });
+    }
 
     let bridge = bridge::Bridge::new(args.timeout);
 

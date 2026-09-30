@@ -26,6 +26,91 @@ Works with **Figma Desktop and Figma in a browser tab**.
                                    └──────────────────────┘
 ```
 
+## Quickstart
+
+```bash
+git clone https://github.com/swiftkimani/figma-canvas-mcp
+cd figma-canvas-mcp
+cargo build --release
+./target/release/figma-canvas-mcp doctor --project-root /path/to/your/app
+```
+
+`doctor` checks the port, the plugin files, your project's stack, whether a
+language server is available and whether the output directory is writable — then
+prints the exact two commands you need next. Run it first; it turns a first-run
+problem into one line of output instead of a conversation.
+
+Then, the two steps it tells you:
+
+**1. Register the server with your MCP client.**
+
+```bash
+claude mcp add figma-canvas -- /abs/path/to/target/release/figma-canvas-mcp \
+  --project-root /path/to/your/app
+```
+
+<details>
+<summary>Any other MCP client (Cursor, Windsurf, Zed, Cline, Continue, JetBrains…)</summary>
+
+Nothing here is Claude-specific — it is MCP over stdio. Put this in your client's
+MCP config:
+
+```json
+{
+  "mcpServers": {
+    "figma-canvas": {
+      "command": "/abs/path/to/target/release/figma-canvas-mcp",
+      "args": ["--project-root", "/path/to/your/app", "--out-dir", "./figma-out"]
+    }
+  }
+}
+```
+</details>
+
+**2. Load the plugin in Figma.**
+
+Figma → **Plugins → Development → Import plugin from manifest…** → choose
+`plugin/manifest.json` from this repo.
+
+Then open your file and run **Plugins → Development → Figma Canvas Bridge**.
+Leave the panel open; a green dot means it is attached. It reconnects by itself,
+so a Figma reload or a browser refresh needs no restart.
+
+**Check it worked:** ask your client to call `figma_status`. `"connected": true`
+and a green dot in the panel means you are done.
+
+### Your first useful call
+
+Select a frame in Figma, then:
+
+| ask for | tool | costs |
+|---|---|---|
+| "what's in this frame?" | `read_scene` | ~400 tokens |
+| "build this as a component" | `generate_code` | the code itself |
+| "what are the design tokens?" | `get_tokens` | small |
+| "export the icons" | `export_assets` | writes files |
+
+`generate_code` needs no `read_scene` first — one call, not two.
+
+## When it does not work
+
+Roughly in the order these actually happen:
+
+| symptom | cause | fix |
+|---|---|---|
+| `figma_status` says "Not connected" | the plugin panel is closed | Open your file and run **Plugins → Development → Figma Canvas Bridge**. The panel must stay open. |
+| plugin panel shows "Reconnecting…" forever | the server is not running, or is on another port | Your MCP client starts the server — check it is configured and enabled. Then `doctor` to confirm the port. |
+| plugin will not connect in Safari or Firefox | those browsers block loopback WebSockets | Use the Figma **Desktop** app, or Chrome/Edge, which treat `ws://127.0.0.1` as trustworthy. |
+| `cannot bind 127.0.0.1:18765` | another copy is already running | Stop it, or use `--port`, and change `var PORT` in `plugin/ui.html` and `allowedDomains` in `plugin/manifest.json` to match. `doctor` verifies all three agree. |
+| "nests deeper than 40 levels" | the selection is very deeply nested | Select a nested frame and read it by `node_id` instead. |
+| imports point at components that do not exist | no language server, so paths follow convention only | Install `typescript-language-server`. Optional — but then paths are verified rather than inferred. |
+| output is full of `position: absolute` | the design does not use auto layout | Not a tool problem. `read_scene` reports this and says what to change; see [Organised files and real ones](#organised-files-and-real-ones). |
+| class names are `frame427`, `group12` | layers still have Figma's default names | Rename the layers that matter. Cheapest change with the biggest effect on readability. |
+| blank plugin panel, empty console | a syntax error in `plugin/code.js` | Figma reports these silently. `cargo test` catches it; so does `node --check plugin/code.js`. |
+
+Still stuck? `doctor` output plus what the plugin panel says is almost always
+enough to identify it.
+
 ## Why not just use the REST API?
 
 | | REST API | This |
@@ -37,65 +122,6 @@ Works with **Figma Desktop and Figma in a browser tab**.
 | Component variant values | partial | full `componentProperties` |
 | Asset export at scale | separate render call | `exportAsync()` direct |
 | View-only files | needs file access | works if you can open the file |
-
-## Why is there JavaScript if this is a Rust project?
-
-Because Figma's plugin host exposes `figma.currentPage.selection` and
-`getCSSAsync()` **to JavaScript only** — nothing else can reach inside that
-sandbox. So `plugin/` is a thin projection: it reads Figma's API and forwards a
-flat JSON shape, with no logic of its own.
-
-Everything that decides what a design *means* is Rust: the IR, the auto-layout →
-flexbox mapping, token resolution, and code generation — all unit-tested.
-
-**There is no Node.js runtime dependency.** No `npm install`, no `node_modules`, no
-build step. Figma loads `code.js` as-is.
-
-## Install
-
-Needs a recent stable Rust (the crate uses edition 2024).
-
-```bash
-git clone https://github.com/swiftkimani/figma-canvas-mcp
-cd figma-canvas-mcp
-cargo build --release
-# binary at ./target/release/figma-canvas-mcp
-```
-
-Or grab a prebuilt binary for Linux, macOS (Intel and Apple Silicon) or Windows
-from [Releases](https://github.com/swiftkimani/figma-canvas-mcp/releases) — each
-archive bundles the `plugin/` directory too.
-
-### 1. Register the server with your MCP client
-
-Claude Code:
-
-```bash
-claude mcp add figma-canvas -- /absolute/path/to/target/release/figma-canvas-mcp
-```
-
-Or by hand, in your client's MCP config:
-
-```json
-{
-  "mcpServers": {
-    "figma-canvas": {
-      "command": "/absolute/path/to/target/release/figma-canvas-mcp",
-      "args": ["--out-dir", "./figma-out"]
-    }
-  }
-}
-```
-
-### 2. Load the plugin in Figma
-
-Figma → **Plugins → Development → Import plugin from manifest…** → pick
-`plugin/manifest.json`.
-
-Then, with your file open: **Plugins → Development → Figma Canvas Bridge**. The
-panel shows a green dot when it is attached. Leave it open while you work.
-
-It reconnects on its own, so a Figma reload or a browser refresh needs no restart.
 
 ## Tools
 
@@ -110,6 +136,64 @@ It reconnects on its own, so a Figma reload or a browser refresh needs no restar
 | `export_assets` | SVG / PNG / JPG / PDF at any scale, written to disk |
 | `get_interactions` | Prototype triggers, actions, and motion — durations, easing, and the screen flow |
 | `generate_code` | React + TypeScript, with CSS modules, Tailwind, or inline styles |
+
+## Install, in more detail
+
+Needs a recent stable Rust (the crate uses edition 2024).
+
+```bash
+git clone https://github.com/swiftkimani/figma-canvas-mcp
+cd figma-canvas-mcp
+cargo build --release
+# binary at ./target/release/figma-canvas-mcp
+```
+
+Or grab a prebuilt binary for Linux, macOS (Intel and Apple Silicon) or Windows
+from [Releases](https://github.com/swiftkimani/figma-canvas-mcp/releases) — each
+archive bundles the `plugin/` directory too.
+
+See [Quickstart](#quickstart) for registering the server and loading the plugin.
+
+## Why is there JavaScript if this is a Rust project?
+
+Because Figma's plugin host exposes `figma.currentPage.selection` and
+`getCSSAsync()` **to JavaScript only** — nothing else can reach inside that
+sandbox. So `plugin/` is a thin projection: it reads Figma's API and forwards a
+flat JSON shape, with no logic of its own.
+
+Everything that decides what a design *means* is Rust: the IR, the auto-layout →
+flexbox mapping, token resolution, and code generation — all unit-tested.
+
+**There is no Node.js runtime dependency.** No `npm install`, no `node_modules`, no
+build step. Figma loads `code.js` as-is.
+
+## Choosing what to spend
+
+Every read states its own price and the alternatives, so nobody discovers the
+cost after paying it:
+
+```
+[151 nodes · ~392 tokens spent · 162 sketch · 392 standard ← this · ≈39868 precise · ≈39868 exhaustive]
+```
+
+Four levels, measured on the same 151-node screen:
+
+| `fidelity` | what you get | tokens |
+|---|---|---|
+| `sketch` | the skeleton: structure, sizing, ids — no words | ~162 |
+| `standard` *(default)* | full-depth outline with all content | ~392 |
+| `precise` | complete model plus Figma's own CSS per node | ~39,900 |
+| `exhaustive` | as `precise`, no node limit; depth still bounded by the transport | ~39,900 |
+
+The numbers in that line are measured, not guessed — the scene is already in hand
+when the price is printed, so the other renderings are produced and counted.
+Only `precise` and `exhaustive` carry a `≈`, because Figma's per-node CSS was not
+fetched and is roughly twice the size of the model it annotates.
+
+`sketch` is a table of contents rather than a shallower tree, which matters: a
+three-level design is not made cheaper by capping depth, but it is made much
+cheaper by dropping the words. It still keeps every node id and id range, so the
+follow-up call can ask for exactly what it needs.
 
 ## The part that actually matters: layout
 
@@ -142,34 +226,6 @@ Two rules drive this:
    They emit `<Button variant="primary" size="md" />` with placement passed through
    `className`, because placement is the caller's decision while paint is the
    component's.
-
-## Choosing what to spend
-
-Every read states its own price and the alternatives, so nobody discovers the
-cost after paying it:
-
-```
-[151 nodes · ~392 tokens spent · 162 sketch · 392 standard ← this · ≈39868 precise · ≈39868 exhaustive]
-```
-
-Four levels, measured on the same 151-node screen:
-
-| `fidelity` | what you get | tokens |
-|---|---|---|
-| `sketch` | the skeleton: structure, sizing, ids — no words | ~162 |
-| `standard` *(default)* | full-depth outline with all content | ~392 |
-| `precise` | complete model plus Figma's own CSS per node | ~39,900 |
-| `exhaustive` | as `precise`, no node limit; depth still bounded by the transport | ~39,900 |
-
-The numbers in that line are measured, not guessed — the scene is already in hand
-when the price is printed, so the other renderings are produced and counted.
-Only `precise` and `exhaustive` carry a `≈`, because Figma's per-node CSS was not
-fetched and is roughly twice the size of the model it annotates.
-
-`sketch` is a table of contents rather than a shallower tree, which matters: a
-three-level design is not made cheaper by capping depth, but it is made much
-cheaper by dropping the words. It still keeps every node id and id range, so the
-follow-up call can ask for exactly what it needs.
 
 ## It reads your codebase, not just the design
 
@@ -263,23 +319,41 @@ Output is held to what a developer would have written by hand:
   default, so a `.some-class` rule would leave `styles.someClass` undefined at
   runtime — a component that renders silently unstyled with no error anywhere.
 
-## Runs everywhere
+## Motion
 
-Pure portable Rust — the crate contains **no `cfg(target_os)`, no `cfg(unix)`, no
-`cfg(windows)`**, and paths go through `PathBuf` throughout. CI runs the whole
-suite on Linux, macOS and Windows on every push.
+Prototype interactions are read, not skipped. Figma's motion model is richer than
+CSS's, so each case is handled on its own terms:
 
-Prebuilt binaries are published for six native targets, all built on real
-hardware rather than cross-compiled:
-
-| | x86-64 | ARM64 |
+| Figma easing | Emitted | Exact? |
 |---|---|---|
-| Linux | ✓ | ✓ |
-| macOS | ✓ (Intel) | ✓ (Apple Silicon) |
-| Windows | ✓ | ✓ |
+| `LINEAR`, `EASE_IN`, `EASE_OUT`, `EASE_IN_AND_OUT` | the CSS keyword | yes |
+| `CUSTOM_CUBIC_BEZIER` | `cubic-bezier(...)`, same control points | yes |
+| `CUSTOM_SPRING` | `linear(...)` stop list from a simulated oscillator | yes |
+| `EASE_*_BACK` | a `cubic-bezier` of the same shape | **no** — flagged in the output |
 
-The Figma plugin is plain browser JavaScript, so it is platform-independent by
-construction.
+Springs are the interesting one. There is no bezier that reproduces overshoot, so
+instead of flattening a spring into an ease-out, the damped oscillator is actually
+simulated and sampled into a CSS `linear()` stop list, whose values may exceed 1.
+The raw `{mass, stiffness, damping, initialVelocity}` is returned alongside, so
+Framer Motion or similar can use the spring natively.
+
+Triggers split by what CSS can express:
+
+- **Hover and press** become `:hover` / `:active`, with the `transition` placed on
+  the *base* rule so it animates in both directions. No JavaScript needed.
+- **Click, key, drag** become typed, documented React props:
+  ```tsx
+  export interface ProductCardProps {
+    className?: string;
+    /** Navigates to "Product detail". Figma transition: smart animate over 600ms. */
+    onNavigateToProductDetail?: () => void;
+  }
+  ```
+- **Navigation between frames** is also summarised as a flow graph, which is the
+  prototype's routing:
+  ```
+  Product card --on click--> Product detail
+  ```
 
 ## Token cost, and why size stops mattering
 
@@ -375,42 +449,6 @@ there are.
 All enforced by `tests/token_budget.rs`, so a change that reintroduces a verbose
 default fails CI rather than quietly costing someone their window.
 
-## Motion
-
-Prototype interactions are read, not skipped. Figma's motion model is richer than
-CSS's, so each case is handled on its own terms:
-
-| Figma easing | Emitted | Exact? |
-|---|---|---|
-| `LINEAR`, `EASE_IN`, `EASE_OUT`, `EASE_IN_AND_OUT` | the CSS keyword | yes |
-| `CUSTOM_CUBIC_BEZIER` | `cubic-bezier(...)`, same control points | yes |
-| `CUSTOM_SPRING` | `linear(...)` stop list from a simulated oscillator | yes |
-| `EASE_*_BACK` | a `cubic-bezier` of the same shape | **no** — flagged in the output |
-
-Springs are the interesting one. There is no bezier that reproduces overshoot, so
-instead of flattening a spring into an ease-out, the damped oscillator is actually
-simulated and sampled into a CSS `linear()` stop list, whose values may exceed 1.
-The raw `{mass, stiffness, damping, initialVelocity}` is returned alongside, so
-Framer Motion or similar can use the spring natively.
-
-Triggers split by what CSS can express:
-
-- **Hover and press** become `:hover` / `:active`, with the `transition` placed on
-  the *base* rule so it animates in both directions. No JavaScript needed.
-- **Click, key, drag** become typed, documented React props:
-  ```tsx
-  export interface ProductCardProps {
-    className?: string;
-    /** Navigates to "Product detail". Figma transition: smart animate over 600ms. */
-    onNavigateToProductDetail?: () => void;
-  }
-  ```
-- **Navigation between frames** is also summarised as a flow graph, which is the
-  prototype's routing:
-  ```
-  Product card --on click--> Product detail
-  ```
-
 ## Organised files and real ones
 
 The same generator produces excellent code from a disciplined file and a pile of
@@ -465,6 +503,24 @@ component, diagnosed without anybody asking.
 
 Every problem carries a fix, and a test fails if one does not — "improve your
 file" is not actionable, and "select the frame and press Shift+A" is.
+
+## Runs everywhere
+
+Pure portable Rust — the crate contains **no `cfg(target_os)`, no `cfg(unix)`, no
+`cfg(windows)`**, and paths go through `PathBuf` throughout. CI runs the whole
+suite on Linux, macOS and Windows on every push.
+
+Prebuilt binaries are published for six native targets, all built on real
+hardware rather than cross-compiled:
+
+| | x86-64 | ARM64 |
+|---|---|---|
+| Linux | ✓ | ✓ |
+| macOS | ✓ (Intel) | ✓ (Apple Silicon) |
+| Windows | ✓ | ✓ |
+
+The Figma plugin is plain browser JavaScript, so it is platform-independent by
+construction.
 
 ## Tested under the worst conditions, not just the best
 
@@ -524,6 +580,14 @@ What the suite covers now:
 
 ## Known gaps
 
+**Not yet exercised against a real Figma file.** The Rust side is covered
+thoroughly — 122 tests including an adversarial suite — and the plugin is written
+against the documented Plugin API and syntax-checked in CI. But its projection
+has only ever been driven by a fake plugin over a loopback socket. The first run
+against a real document is the remaining unknown, and `doctor` plus what the
+plugin panel reports will identify anything that surfaces.
+
+
 Stated plainly, because a tool that hides its limits wastes your time:
 
 **Needs the file open.** This reads what Figma has loaded. No plugin panel, no
@@ -582,10 +646,26 @@ WebSockets — use Figma Desktop there, or terminate TLS locally.
 - Full grid track reconstruction.
 - Vue and Svelte emitters — the IR is framework-agnostic; only `codegen` is not.
 
+## Reference
+
+`figma-canvas-mcp --help` for all flags. The ones that matter:
+
+| flag | default | what it does |
+|---|---|---|
+| `--project-root <DIR>` | working directory | The repo whose stack and conventions generated code should follow |
+| `--out-dir <DIR>` | `./figma-out` | Where `generate_code` and `export_assets` write |
+| `--port <PORT>` | `18765` | Bridge port. Must match the plugin; `doctor` checks |
+| `--request-timeout <SECS>` | `30` | How long to wait for the plugin on one call |
+| `doctor` | — | Check everything and print the config to copy |
+
+Logs go to **stderr**, never stdout — stdout carries the MCP JSON-RPC stream, so
+a stray log line there would corrupt the protocol. `RUST_LOG=figma_canvas_mcp=debug`
+for more of them.
+
 ## Development
 
 ```bash
-cargo test                                      # 117 tests
+cargo test                                      # 122 tests
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all --check
 node --check plugin/code.js                     # syntax only; not a dependency
@@ -595,7 +675,7 @@ Four layers of test, all run by CI on Linux, macOS and Windows:
 
 | Suite | What it covers |
 |---|---|
-| unit (70) | The layout mapping, codegen rules, and motion — including a test that fails if `getCSSAsync()` ever overrides the IR's layout, and one asserting an underdamped spring actually overshoots while an overdamped one does not |
+| unit (75) | The layout mapping, codegen rules, and motion — including a test that fails if `getCSSAsync()` ever overrides the IR's layout, and one asserting an underdamped spring actually overshoots while an overdamped one does not |
 | `tests/bridge_roundtrip.rs` (8) | The real WebSocket server driven by a fake plugin — wire protocol, IR, motion and codegen end to end, without Figma |
 | `tests/plugin_consistency.rs` (7) | Rust/plugin drift: port agreement across `main.rs`, `manifest.json` and `ui.html`; every op the server calls exists in the plugin and none are dead; no synchronous Figma APIs under `documentAccess: dynamic-page` |
 | `tests/lsp_protocol.rs` (7) | The real LSP client against a fake language server over an in-memory pipe — framing, handshake, request correlation, fuzzy-match rejection, `node_modules` deprioritisation, and that a hung server times out instead of blocking generation |

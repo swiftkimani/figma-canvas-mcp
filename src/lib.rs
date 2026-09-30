@@ -13,6 +13,7 @@
 pub mod bridge;
 pub mod codegen;
 pub mod css;
+pub mod doctor;
 pub mod health;
 pub mod ir;
 pub mod lsp;

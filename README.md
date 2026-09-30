@@ -148,6 +148,29 @@ cargo build --release
 # binary at ./target/release/figma-canvas-mcp
 ```
 
+### Installing it system-wide
+
+```bash
+cargo install --path .                      # -> ~/.cargo/bin/figma-canvas-mcp
+mkdir -p ~/.figma-canvas-mcp/plugin
+cp plugin/* ~/.figma-canvas-mcp/plugin/     # a stable path for Figma to import
+```
+
+`cargo install` copies the binary and nothing else, so the plugin needs its own
+home. `~/.figma-canvas-mcp/plugin` is the first place `doctor` looks, which means
+an installed server finds it from any directory — and Figma only has to be
+pointed at that path once.
+
+Register it for every project:
+
+```bash
+claude mcp add figma-canvas --scope user -- ~/.cargo/bin/figma-canvas-mcp
+```
+
+With no `--project-root`, the server follows whatever directory your client
+launches it in, so it matches the project you are actually working in. Add an
+explicit `--project-root` only if you want it pinned to one repo.
+
 Or grab a prebuilt binary for Linux, macOS (Intel and Apple Silicon) or Windows
 from [Releases](https://github.com/swiftkimani/figma-canvas-mcp/releases) — each
 archive bundles the `plugin/` directory too.

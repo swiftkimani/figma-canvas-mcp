@@ -54,11 +54,19 @@ pub async fn run(opts: &Options) -> bool {
     let plugin_dir = find_plugin_dir();
     match &plugin_dir {
         None => {
-            println!("[{WARN}] plugin/ not found next to the binary or in the current directory");
-            println!(
-                "        Clone the repo, or download the release archive: it bundles plugin/. \
-                 Figma needs those three files on disk to import."
-            );
+            println!("[{WARN}] plugin files not found");
+            match install_dir() {
+                Some(d) => println!(
+                    "        Copy them somewhere stable and Figma can be pointed at them once:\n\
+                     \x20         mkdir -p {}\n\
+                     \x20         cp plugin/* {}/",
+                    d.display(),
+                    d.display()
+                ),
+                None => println!(
+                    "        Clone the repo or download the release archive; it bundles plugin/."
+                ),
+            }
         }
         Some(dir) => {
             println!("[{OK}] plugin files at {}", dir.display());
@@ -149,9 +157,25 @@ fn current_exe() -> String {
         .unwrap_or_else(|_| "figma-canvas-mcp".into())
 }
 
-/// Look for `plugin/` beside the binary, then up from the working directory.
+/// Where an installed copy of the plugin lives.
+///
+/// `cargo install` copies the binary and nothing else, so an installed server
+/// has no `plugin/` beside it. This is the stable path a user can point Figma's
+/// file picker at once and forget about.
+pub fn install_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(|h| PathBuf::from(h).join(".figma-canvas-mcp/plugin"))
+}
+
+/// Look for `plugin/` in the install location, beside the binary, then up from
+/// the working directory.
 fn find_plugin_dir() -> Option<PathBuf> {
     let mut candidates = Vec::new();
+    // An installed copy takes precedence: it is the one that stays put.
+    if let Some(d) = install_dir() {
+        candidates.push(d);
+    }
     if let Ok(exe) = std::env::current_exe() {
         // target/release/figma-canvas-mcp -> ../../plugin
         for up in 1..=3 {

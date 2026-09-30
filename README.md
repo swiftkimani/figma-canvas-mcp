@@ -6,11 +6,19 @@
 Read a **live Figma canvas** over a local plugin bridge and reconstruct it as code.
 One Rust binary, no Figma API token, no REST rate limit, no Node.js runtime.
 
-> **Requires the Figma Desktop app.** Figma's browser app has no plugin
-> development mode at all — `Plugins → Development` does not exist there, so a
-> local plugin cannot be imported. Once imported in Desktop, the bridge itself
-> runs fine in a browser tab; but the import is Desktop-only and there is no way
-> around it. See [Which Figma tool to use](#which-figma-tool-to-use).
+Two ways in, and **one of them works from a browser**:
+
+| | plugin bridge | REST |
+|---|---|---|
+| Figma Desktop app | **required** to import the plugin | not needed |
+| Edit access | not needed | not needed |
+| Rate limits | none | Figma's |
+| `getCSSAsync()`, variable names | yes | no |
+| Reads a live selection | yes | no — takes a URL |
+
+Figma's browser app has no plugin development mode at all — `Plugins →
+Development` does not exist there — so browser-only users take the REST route.
+See [Which Figma tool to use](#which-figma-tool-to-use).
 
 ```
 ┌──────────────┐  MCP over stdio   ┌──────────────────────┐
@@ -32,26 +40,58 @@ One Rust binary, no Figma API token, no REST rate limit, no Node.js runtime.
 
 ## Which Figma tool to use
 
-Two tools read Figma, and their requirements are **opposite**. Knowing which one
-fits saves a lot of wasted effort:
+Three ways to read a Figma file, with genuinely different requirements:
 
-| | this tool | Figma's own MCP connector |
-|---|---|---|
-| Figma Desktop app | **required** (to import the plugin) | not needed |
-| Edit access to the file | **not needed** — view-only is fine | **required** |
-| Rate limits | none | yes |
-| `getCSSAsync()`, variables on any plan | yes | limited |
+| | this tool, plugin | this tool, REST | Figma's own connector |
+|---|---|---|---|
+| Desktop app | **required** | no | no |
+| Edit access | no | no | **required** |
+| Browser-only works | no | **yes** | yes, with edit access |
+| Rate limits | none | Figma's | yes |
+| `getCSSAsync()` | yes | no | some |
+| Live selection | yes | no, takes a URL | yes |
 
-So:
+- **Browser only, view-only access** → this tool over REST. It is the only route
+  that clears both bars. Set `FIGMA_TOKEN` and pass a URL.
+- **Desktop app, view-only access** → the plugin bridge. Richest data, no rate
+  limits, and the Plugin API reads any file you can open.
+- **Edit access and happy in the browser** → Figma's own connector also works.
 
-- **View-only access to someone else's file, and you have Desktop** → this tool.
-  It runs through the Plugin API, which works on any file you can open.
-- **Edit access, and you want to stay in the browser** → Figma's own connector.
-  No plugin, no Desktop, works immediately.
-- **View-only *and* browser-only** → neither works as-is. Duplicate the file into
-  a team where you are an editor (`File → Duplicate`, then move it), which takes
-  a few seconds in the browser and gives you edit access to your copy. Then use
-  Figma's connector.
+### Reading over REST
+
+Create a token at **figma.com → Settings → Security → Personal access tokens**,
+scope `file_content:read`. It needs only *view* access to the files you read, and
+it is created entirely in the browser.
+
+```bash
+export FIGMA_TOKEN=figd_...
+```
+
+Or put it in the MCP client entry so it is scoped to this server:
+
+```json
+{
+  "mcpServers": {
+    "figma-canvas": {
+      "command": "/abs/path/to/figma-canvas-mcp",
+      "env": { "FIGMA_TOKEN": "figd_..." }
+    }
+  }
+}
+```
+
+Then pass a URL instead of relying on a selection:
+
+```
+read_scene    url="https://figma.com/design/<key>/<name>?node-id=4442-1220"
+generate_code url="https://figma.com/design/<key>/<name>?node-id=4442-1220"
+```
+
+`/design/`, `/file/` and `/proto/` links all work; the `node-id` is read from the
+query string. What REST cannot give you, stated plainly: no `getCSSAsync()`, so
+appearance comes from the node's own properties; variable *names* need an
+Enterprise-only endpoint, so token-bound fills arrive as literal values; and
+Figma rate limits it.
 
 ## Quickstart
 
@@ -752,7 +792,7 @@ for more of them.
 ## Development
 
 ```bash
-cargo test                                      # 122 tests
+cargo test                                      # 128 tests
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all --check
 node --check plugin/code.js                     # syntax only; not a dependency
@@ -762,7 +802,7 @@ Four layers of test, all run by CI on Linux, macOS and Windows:
 
 | Suite | What it covers |
 |---|---|
-| unit (75) | The layout mapping, codegen rules, and motion — including a test that fails if `getCSSAsync()` ever overrides the IR's layout, and one asserting an underdamped spring actually overshoots while an overdamped one does not |
+| unit (81) | The layout mapping, codegen rules, and motion — including a test that fails if `getCSSAsync()` ever overrides the IR's layout, and one asserting an underdamped spring actually overshoots while an overdamped one does not |
 | `tests/bridge_roundtrip.rs` (8) | The real WebSocket server driven by a fake plugin — wire protocol, IR, motion and codegen end to end, without Figma |
 | `tests/plugin_consistency.rs` (7) | Rust/plugin drift: port agreement across `main.rs`, `manifest.json` and `ui.html`; every op the server calls exists in the plugin and none are dead; no synchronous Figma APIs under `documentAccess: dynamic-page` |
 | `tests/lsp_protocol.rs` (7) | The real LSP client against a fake language server over an in-memory pipe — framing, handshake, request correlation, fuzzy-match rejection, `node_modules` deprioritisation, and that a hung server times out instead of blocking generation |

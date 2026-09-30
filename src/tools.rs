@@ -25,6 +25,7 @@ use crate::lsp::{self, LspClient};
 use crate::motion::{self, Action, Interaction};
 use crate::outline::{self, Budget};
 use crate::raw::{RawNode, RawVariable};
+use crate::rest::{self, RestClient};
 use crate::stack::{self, Stack};
 
 /// What this response cost, and what the other levels would have.
@@ -155,6 +156,15 @@ impl Fidelity {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ReadSceneArgs {
+    /// A Figma URL to read over the REST API, e.g.
+    /// https://figma.com/design/<key>/<name>?node-id=1-2
+    ///
+    /// Use this when the plugin bridge is unavailable: REST needs only view
+    /// access and no Desktop app, so it is the route that works from a browser.
+    /// Requires FIGMA_TOKEN in the environment. Omit to read the live selection
+    /// through the plugin instead.
+    #[serde(default)]
+    pub url: Option<String>,
     /// Figma node ids to read. Omit to use the current selection in Figma.
     #[serde(default)]
     pub node_ids: Option<Vec<String>>,
@@ -206,6 +216,10 @@ pub struct ExportArgs {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct GenerateArgs {
+    /// A Figma URL to read over REST instead of the live selection. Needs only
+    /// view access and FIGMA_TOKEN; no plugin or Desktop app.
+    #[serde(default)]
+    pub url: Option<String>,
     /// Figma node ids. Omit to use the current selection.
     #[serde(default)]
     pub node_ids: Option<Vec<String>>,
@@ -359,6 +373,48 @@ impl FigmaServer {
         Ok(())
     }
 
+    /// Read a Figma URL over REST, without the plugin.
+    async fn scene_over_rest(
+        &self,
+        url: &str,
+        ids: Option<Vec<String>>,
+        depth: u32,
+    ) -> Result<Vec<ir::Node>, ErrorData> {
+        let Some(client) = RestClient::from_env() else {
+            return Err(bad(
+                "Reading a URL needs a Figma token. Create one at figma.com > Settings > \
+                 Security > Personal access tokens (scope: file_content:read), then set \
+                 FIGMA_TOKEN in this server's environment. It needs only view access to the \
+                 file, and no Desktop app.",
+            ));
+        };
+
+        let Some((file_key, node_from_url)) = rest::parse_url(url) else {
+            return Err(bad(format!(
+                "Could not read a Figma file key from {url}. Expected something like \
+                 https://figma.com/design/<key>/<name>?node-id=1-2"
+            )));
+        };
+
+        // Explicit ids win; otherwise use the one in the link.
+        let wanted: Vec<String> = match (ids, node_from_url) {
+            (Some(v), _) if !v.is_empty() => v,
+            (_, Some(n)) => vec![n],
+            _ => {
+                return Err(bad(
+                    "That URL has no node-id, and REST has no notion of a selection. Open the \
+                     frame in Figma and copy its link, or pass node_ids.",
+                ));
+            }
+        };
+
+        let raws = client
+            .fetch_nodes(&file_key, &wanted, Some(depth))
+            .await
+            .map_err(|e| bad(format!("{e:#}")))?;
+        Ok(raws.iter().map(ir::build).collect())
+    }
+
     async fn scene(
         &self,
         ids: Option<Vec<String>>,
@@ -429,17 +485,34 @@ impl FigmaServer {
             return Ok(lines.join("\n"));
         }
 
+        // The plugin is unreachable from a browser, so if REST is configured say
+        // so rather than only offering the route that cannot work there.
+        let rest_note = match RestClient::from_env() {
+            Some(_) => {
+                "\n\nFIGMA_TOKEN is set, so you can skip the plugin entirely: pass a \
+                        Figma URL to read_scene or generate_code and they will read it over \
+                        the REST API. That needs only view access and works from a browser."
+            }
+            None => {
+                "\n\nNo plugin and no FIGMA_TOKEN. If you work in a browser tab, the \
+                     plugin is not available there at all — Figma has no plugin development \
+                     mode in the browser. Set FIGMA_TOKEN instead and pass a Figma URL."
+            }
+        };
+
         if !s.connected {
-            return Ok(concat!(
-                "Not connected.\n\n",
-                "Open your file in Figma (Desktop app or a browser tab), then run\n",
-                "  Plugins > Development > Figma Canvas Bridge\n",
-                "and leave the plugin panel open. It reconnects on its own.\n\n",
-                "Browser note: Chrome and Edge allow ws://127.0.0.1 from https://figma.com. \
+            return Ok(format!(
+                "{}{rest_note}",
+                concat!(
+                    "Not connected.\n\n",
+                    "Open your file in Figma (Desktop app or a browser tab), then run\n",
+                    "  Plugins > Development > Figma Canvas Bridge\n",
+                    "and leave the plugin panel open. It reconnects on its own.\n\n",
+                    "Browser note: Chrome and Edge allow ws://127.0.0.1 from https://figma.com. \
                  Safari and Firefox are stricter about loopback WebSockets — use the Desktop \
                  app there."
-            )
-            .to_string());
+                )
+            ));
         }
 
         let h = s.hello.as_ref();
@@ -487,9 +560,16 @@ impl FigmaServer {
         let asked = args.depth.unwrap_or(0);
         let clamped = asked > MAX_WIRE_DEPTH;
 
-        let nodes = self
-            .scene(args.node_ids, budget.max_depth as u32, include_css)
-            .await?;
+        let nodes = match &args.url {
+            Some(url) => {
+                self.scene_over_rest(url, args.node_ids, budget.max_depth as u32)
+                    .await?
+            }
+            None => {
+                self.scene(args.node_ids, budget.max_depth as u32, include_css)
+                    .await?
+            }
+        };
         if nodes.is_empty() {
             return Ok("Nothing to read. Select a frame in Figma, or pass node_ids.".into());
         }
@@ -832,9 +912,13 @@ impl FigmaServer {
         &self,
         Parameters(args): Parameters<GenerateArgs>,
     ) -> Result<String, ErrorData> {
-        let nodes = self
-            .scene(args.node_ids, 24, args.include_css.unwrap_or(true))
-            .await?;
+        let nodes = match &args.url {
+            Some(url) => self.scene_over_rest(url, args.node_ids, 24).await?,
+            None => {
+                self.scene(args.node_ids, 24, args.include_css.unwrap_or(true))
+                    .await?
+            }
+        };
         let Some(root) = nodes.first() else {
             return Ok("Nothing to generate. Select a frame in Figma, or pass node_ids.".into());
         };
@@ -915,6 +999,7 @@ impl FigmaServer {
         fidelity: Option<Fidelity>,
     ) -> Result<String, ErrorData> {
         self.read_scene(Parameters(ReadSceneArgs {
+            url: None,
             node_ids: None,
             fidelity,
             depth: None,

@@ -9,7 +9,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::{DEFAULT_BRIDGE_PORT, lsp, stack};
+use crate::{DEFAULT_BRIDGE_PORT, lsp, rest, stack};
 
 const OK: &str = "ok  ";
 const WARN: &str = "warn";
@@ -80,6 +80,29 @@ pub async fn run(opts: &Options) -> bool {
                     println!("[{FAIL}] {problem}");
                 }
             }
+        }
+    }
+
+    // --- the REST route, which is the only one a browser user can take ---
+    match rest::RestClient::from_env() {
+        Some(_) => {
+            println!("[{OK}] FIGMA_TOKEN is set — URLs can be read over REST, no plugin needed");
+        }
+        None => {
+            println!("[{WARN}] FIGMA_TOKEN is not set");
+            println!(
+                "        Without it, reading requires the plugin, which Figma only offers in \
+                 the Desktop app."
+            );
+            println!(
+                "        If you work in a browser: create a token at figma.com > Settings > \
+                 Security"
+            );
+            println!(
+                "        > Personal access tokens (scope file_content:read), then set \
+                 FIGMA_TOKEN."
+            );
+            println!("        It needs only view access to the files you read.");
         }
     }
 

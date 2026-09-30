@@ -21,6 +21,7 @@ pub mod motion;
 pub mod outline;
 pub mod protocol;
 pub mod raw;
+pub mod rest;
 pub mod stack;
 pub mod tools;
 

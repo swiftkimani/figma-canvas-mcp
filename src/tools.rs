@@ -112,6 +112,24 @@ pub enum Fidelity {
     Exhaustive,
 }
 
+/// The deepest tree we will ask the plugin for.
+///
+/// Two separate ceilings, and this sits safely under the lower one:
+///
+/// * serde_json rejects deserialisation past 128 nesting levels, and a node
+///   costs two of them (an object inside a `children` array), so 62 node levels
+///   is where the payload stops parsing at all.
+/// * Deserialising — and dropping — a nested tree is recursive, and a tool call
+///   runs on a tokio worker with a 2 MiB stack, not the main thread's 8 MiB. At
+///   that size 56 levels is fine and 62 aborts the process.
+///
+/// So the parse limit is not the real limit; the stack is. 40 leaves substantial
+/// headroom, and is still far deeper than designs actually nest — Figma files
+/// rarely pass 30. `tests/adversarial.rs` verifies this depth survives on a
+/// deliberately constrained stack, so a regression fails the suite rather than
+/// crashing a user's server.
+pub const MAX_WIRE_DEPTH: u32 = 40;
+
 impl Fidelity {
     fn is_full(self) -> bool {
         matches!(self, Fidelity::Precise | Fidelity::Exhaustive)
@@ -122,10 +140,11 @@ impl Fidelity {
             Fidelity::Sketch => (3, 60),
             Fidelity::Standard => (12, 300),
             Fidelity::Precise => (12, 1_000),
-            Fidelity::Exhaustive => (u32::MAX, u32::MAX),
+            // "Exhaustive" is bounded by the wire format, not by choice.
+            Fidelity::Exhaustive => (MAX_WIRE_DEPTH, u32::MAX),
         };
         Budget {
-            max_depth: depth.unwrap_or(d) as usize,
+            max_depth: depth.unwrap_or(d).min(MAX_WIRE_DEPTH) as usize,
             max_nodes: max_nodes.unwrap_or(n) as usize,
             // A sketch is the skeleton: structure without the words in it.
             show_content: self != Fidelity::Sketch,
@@ -340,8 +359,19 @@ impl FigmaServer {
         params["includeCss"] = json!(include_css);
 
         let raw = self.bridge.call("scene", params).await?;
-        let roots: Vec<RawNode> = serde_json::from_value(raw)
-            .map_err(|e| bad(format!("plugin sent a scene we could not decode: {e}")))?;
+        let roots: Vec<RawNode> = serde_json::from_value(raw).map_err(|e| {
+            // The default failure here is "recursion limit exceeded", which tells
+            // the caller nothing they can act on.
+            if e.to_string().contains("recursion limit") {
+                bad(format!(
+                    "This selection nests deeper than {MAX_WIRE_DEPTH} levels, which the \
+                     plugin transport cannot carry. Read a nested frame directly by its \
+                     node_id, or lower depth."
+                ))
+            } else {
+                bad(format!("plugin sent a scene we could not decode: {e}"))
+            }
+        })?;
         Ok(roots.iter().map(ir::build).collect())
     }
 
@@ -418,22 +448,29 @@ impl FigmaServer {
         // per-node CSS, so it is only fetched where it is actually rendered.
         let include_css = args.include_css.unwrap_or(fidelity.is_full()) && fidelity.is_full();
 
+        let asked = args.depth.unwrap_or(0);
+        let clamped = asked > MAX_WIRE_DEPTH;
+
         let nodes = self
-            .scene(
-                args.node_ids,
-                budget.max_depth.min(u32::MAX as usize) as u32,
-                include_css,
-            )
+            .scene(args.node_ids, budget.max_depth as u32, include_css)
             .await?;
         if nodes.is_empty() {
             return Ok("Nothing to read. Select a frame in Figma, or pass node_ids.".into());
         }
 
-        let body = if fidelity.is_full() {
+        let mut body = if fidelity.is_full() {
             pretty(&nodes)?
         } else {
             outline::render(&nodes, &budget)
         };
+
+        if clamped {
+            body = format!(
+                "Note: depth {asked} was clamped to {MAX_WIRE_DEPTH}, the deepest tree the \
+                 plugin transport can carry. Read a nested frame directly by its node_id to \
+                 go further.\n\n{body}"
+            );
+        }
 
         Ok(format!(
             "{body}\n{}",
@@ -513,6 +550,7 @@ impl FigmaServer {
                 figma_css: None,
                 tokens: Default::default(),
                 exportable: false,
+                truncated: false,
                 interactions: vec![],
                 children: vec![],
             },

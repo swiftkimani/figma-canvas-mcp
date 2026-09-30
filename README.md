@@ -159,7 +159,7 @@ Four levels, measured on the same 151-node screen:
 | `sketch` | the skeleton: structure, sizing, ids — no words | ~162 |
 | `standard` *(default)* | full-depth outline with all content | ~392 |
 | `precise` | complete model plus Figma's own CSS per node | ~39,900 |
-| `exhaustive` | as `precise`, with no depth or node limit | ~39,900 |
+| `exhaustive` | as `precise`, no node limit; depth still bounded by the transport | ~39,900 |
 
 The numbers in that line are measured, not guessed — the scene is already in hand
 when the price is printed, so the other renderings are produced and counted.
@@ -411,6 +411,62 @@ Triggers split by what CSS can express:
   Product card --on click--> Product detail
   ```
 
+## Tested under the worst conditions, not just the best
+
+`tests/adversarial.rs` exists because the happy-path tests prove the tool *works*
+and prove nothing about whether it *breaks*. Everything the plugin sends is
+treated as untrusted: it runs in Figma and speaks over a socket, and a bug in it,
+an unexpected API change, or anything else on loopback can put arbitrary bytes on
+that wire.
+
+Writing it found five real defects, each of which would have reached a user:
+
+**A deep design aborted the whole process.** Every tree walk — conversion,
+hashing, outlining, codegen, and the tree's own `Drop` — is recursive, and none
+was bounded. A design nested past the stack limit did not error; it hit
+`fatal runtime error: stack overflow` and killed the server, taking the bridge
+and all state with it.
+
+**The depth limit was measured on the wrong stack.** The first fix capped depth
+at 62, the point where serde_json stops parsing. But a tool call runs on a tokio
+worker with a **2 MiB** stack, not the main thread's 8 MiB — and at that size 56
+levels survives while 62 aborts. The parse limit was never the real limit; the
+stack was. The cap is now 40, with the measurement recorded, and a test that runs
+on a deliberately constrained 2 MiB stack so a regression fails CI instead of
+crashing someone's server.
+
+**CSS injection through three plugin-supplied strings.** `font-family`,
+`line-height`, `letter-spacing` and every key and value of `getCSSAsync()` went
+into the stylesheet verbatim. A font named `Inter"; background: url(...)` escaped
+its declaration. Values with a known shape are now *validated* against it rather
+than stripped — because removing the `;` from `20px; position: fixed` leaves
+`20px position: fixed`, which is inert but should never have been written.
+Property names must be identifiers, and values carrying `url(`, `@import`,
+`expression(` or `javascript:` are dropped rather than repaired.
+
+**Indentation grew O(depth²).** A 1,000-level tree produced **2 MB** of
+generated TSX, nearly all of it whitespace.
+
+**A 10,000-character layer name produced a 10,000-character class name.**
+
+What the suite covers now:
+
+| condition | requirement |
+|---|---|
+| 20,000-level nesting | truncated at the cap, reported in the header, no overflow |
+| 10,000 siblings | collapses to under 8k tokens, true total reported |
+| empty payload | still produces a valid component |
+| negative, 1e300, 1e-300, zero sizes | no panic, no `NaN` or `inf` in CSS |
+| `</div><script>`, `{process.env.SECRET}` in text | escaped to entities |
+| hostile layer names | sanitised to identifiers; no new CSS rule, braces balanced |
+| hostile font / spacing values | no `url(`, no injected declaration, real value preserved |
+| CJK, Arabic, emoji, ZWJ, zero-width, RTL override | no char-boundary panic, valid output |
+| 1 MB single text node | outline stays under 4k; content kept in the code |
+| duplicate node ids | all content survives |
+| malformed JSON, bare `{`, unknown kinds, NUL bytes, binary frames | bridge survives and still accepts a valid frame afterwards |
+| plugin vanishes mid-request | fails immediately rather than waiting out the timeout |
+| 8 concurrent requests answered in reverse order | correlated by id, never cross-wired |
+
 ## Known gaps
 
 Stated plainly, because a tool that hides its limits wastes your time:
@@ -474,7 +530,7 @@ WebSockets — use Figma Desktop there, or terminate TLS locally.
 ## Development
 
 ```bash
-cargo test                                      # 92 tests
+cargo test                                      # 109 tests
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all --check
 node --check plugin/code.js                     # syntax only; not a dependency
@@ -484,10 +540,11 @@ Four layers of test, all run by CI on Linux, macOS and Windows:
 
 | Suite | What it covers |
 |---|---|
-| unit (60) | The layout mapping, codegen rules, and motion — including a test that fails if `getCSSAsync()` ever overrides the IR's layout, and one asserting an underdamped spring actually overshoots while an overdamped one does not |
+| unit (62) | The layout mapping, codegen rules, and motion — including a test that fails if `getCSSAsync()` ever overrides the IR's layout, and one asserting an underdamped spring actually overshoots while an overdamped one does not |
 | `tests/bridge_roundtrip.rs` (8) | The real WebSocket server driven by a fake plugin — wire protocol, IR, motion and codegen end to end, without Figma |
 | `tests/plugin_consistency.rs` (7) | Rust/plugin drift: port agreement across `main.rs`, `manifest.json` and `ui.html`; every op the server calls exists in the plugin and none are dead; no synchronous Figma APIs under `documentAccess: dynamic-page` |
 | `tests/lsp_protocol.rs` (7) | The real LSP client against a fake language server over an in-memory pipe — framing, handshake, request correlation, fuzzy-match rejection, `node_modules` deprioritisation, and that a hung server times out instead of blocking generation |
+| `tests/adversarial.rs` (17) | Best case and worst case: pathological depth, 10k siblings, hostile strings and numbers, unicode, malformed frames, mid-request disconnects, concurrent correlation |
 | `tests/mcp_stdio.rs` (3) | A real `initialize` / `tools/list` / `tools/call` handshake against the compiled binary, asserting stdout is clean JSON-RPC |
 | `tests/token_budget.rs` (7) | Enforced token budgets on a realistic 151-node screen, that cost grows sub-linearly with design size, that the fidelity levels are genuinely priced apart, and the per-request schema floor |
 

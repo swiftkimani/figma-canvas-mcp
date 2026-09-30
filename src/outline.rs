@@ -149,14 +149,21 @@ fn paint_summary(node: &Node) -> String {
     if node.is_vector() {
         parts.push("→export".into());
     }
+    if node.truncated {
+        parts.push("⚠depth-capped".into());
+    }
     if !node.interactions.is_empty() {
         parts.push(format!("⚡{}", node.interactions.len()));
     }
     parts.join(" ")
 }
 
+/// Indentation is capped: past this the nesting is conveyed by the ids anyway,
+/// and two spaces per level is pure cost.
+const MAX_INDENT: usize = 24;
+
 fn line(node: &Node, depth: usize, show_content: bool, out: &mut String) {
-    let indent = "  ".repeat(depth);
+    let indent = "  ".repeat(depth.min(MAX_INDENT));
     let _ = write!(
         out,
         "{indent}{} {} · {} {}×{}",
@@ -229,7 +236,7 @@ impl Walker<'_> {
                 let _ = writeln!(
                     out,
                     "{}… {hidden} node(s) below depth {} — read_scene node_ids=[\"{}\"] to continue",
-                    "  ".repeat(depth + 1),
+                    "  ".repeat((depth + 1).min(MAX_INDENT)),
                     self.budget.max_depth,
                     node.id
                 );
@@ -283,7 +290,7 @@ impl Walker<'_> {
             self.walk_children(&first.children, depth + 1, out);
         }
 
-        let indent = "  ".repeat(depth + 1);
+        let indent = "  ".repeat((depth + 1).min(MAX_INDENT));
         let _ = write!(
             out,
             "{indent}↳ ×{} siblings share this shape: {} … {}",
@@ -338,6 +345,10 @@ fn elide(s: &str, max: usize) -> String {
     format!("{head}…")
 }
 
+fn has_capped(node: &Node) -> bool {
+    node.truncated || node.children.iter().any(has_capped)
+}
+
 /// Render an outline for one or more roots.
 pub fn render(roots: &[Node], budget: &Budget) -> String {
     let total: usize = roots.iter().map(Node::count).sum();
@@ -351,7 +362,19 @@ pub fn render(roots: &[Node], budget: &Budget) -> String {
     // Roots are siblings too, so a page of similar frames collapses as well.
     w.walk_children(roots, 0, &mut body);
 
-    let mut out = format!("{total} node(s).\n\n{LEGEND}\n\n{body}");
+    // A depth-capped node may sit far below what this budget renders, so the
+    // fact has to be reported at the top rather than only where it occurred.
+    let capped = roots.iter().any(has_capped);
+    let header = if capped {
+        format!(
+            "{total} node(s). Parts of this tree are deeper than {} levels and were \
+             not converted.\n",
+            crate::ir::MAX_IR_DEPTH
+        )
+    } else {
+        format!("{total} node(s).\n")
+    };
+    let mut out = format!("{header}\n{LEGEND}\n\n{body}");
     if w.skipped > 0 {
         // Name the exact resume points. A count alone leaves the caller guessing
         // what it did not see, which is how silent truncation becomes a wrong

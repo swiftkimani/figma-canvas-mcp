@@ -311,6 +311,9 @@ pub struct Node {
     pub tokens: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub exportable: bool,
+    /// Children were dropped because [`MAX_IR_DEPTH`] was reached.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub truncated: bool,
     /// Prototype interactions declared on this node, with motion resolved.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub interactions: Vec<Interaction>,
@@ -577,11 +580,26 @@ struct ParentCtx {
     flow: Option<Direction>,
 }
 
+/// Hard ceiling on how deep a tree we will materialise.
+///
+/// Every walk over the IR — conversion, hashing, outlining, codegen, and the
+/// tree's own `Drop` — is recursive, so an unbounded tree is a stack overflow,
+/// which aborts the whole process and takes the bridge down with it. Capping at
+/// conversion bounds every downstream walk at once.
+///
+/// The number is chosen against the stack a tool call actually runs on: a tokio
+/// worker gets 2 MiB, not the main thread's 8 MiB, and these node structs are
+/// large. 64 sits well inside that, and still far past how deep real designs
+/// nest. A payload arriving over the bridge is separately capped lower still,
+/// by `tools::MAX_WIRE_DEPTH`; this is the backstop for every other route in,
+/// including direct library use.
+pub const MAX_IR_DEPTH: usize = 64;
+
 pub fn build(raw: &RawNode) -> Node {
-    convert(raw, ParentCtx { flow: None })
+    convert(raw, ParentCtx { flow: None }, 0)
 }
 
-fn convert(raw: &RawNode, parent: ParentCtx) -> Node {
+fn convert(raw: &RawNode, parent: ParentCtx, depth: usize) -> Node {
     let layout = read_layout(raw);
     let child_ctx = ParentCtx {
         flow: match &layout {
@@ -618,12 +636,16 @@ fn convert(raw: &RawNode, parent: ParentCtx) -> Node {
         tokens: raw.bound_variables.clone(),
         exportable: raw.has_export_settings,
         interactions: motion::read_reactions(&raw.reactions),
-        children: raw
-            .children
-            .iter()
-            .filter(|c| c.visible)
-            .map(|c| convert(c, child_ctx))
-            .collect(),
+        truncated: depth >= MAX_IR_DEPTH && !raw.children.is_empty(),
+        children: if depth >= MAX_IR_DEPTH {
+            Vec::new()
+        } else {
+            raw.children
+                .iter()
+                .filter(|c| c.visible)
+                .map(|c| convert(c, child_ctx, depth + 1))
+                .collect()
+        },
     }
 }
 

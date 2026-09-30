@@ -105,6 +105,12 @@ impl Ctx {
             &node.name
         };
         let mut base = camel_case(&kebab_case(source));
+        // Figma layer names can be arbitrarily long; a class name cannot be, or
+        // it is unusable in the stylesheet a person has to maintain.
+        const MAX_CLASS_LEN: usize = 48;
+        if base.chars().count() > MAX_CLASS_LEN {
+            base = base.chars().take(MAX_CLASS_LEN).collect();
+        }
         if base.is_empty() || base.starts_with(|c: char| c.is_ascii_digit()) {
             base = format!("c{base}");
         }
@@ -465,6 +471,10 @@ fn interaction_attrs(node: &Node, class: &str, ctx: &mut Ctx) -> String {
     events
 }
 
+/// Indentation stops growing past this, because two spaces per level over a
+/// thousand levels is a megabyte of whitespace and unreadable either way.
+const MAX_INDENT: usize = 24;
+
 fn emit(
     node: &Node,
     parent: Option<&Layout>,
@@ -472,7 +482,7 @@ fn emit(
     indent: usize,
     is_root: bool,
 ) -> String {
-    let pad = "  ".repeat(indent);
+    let pad = "  ".repeat(indent.min(MAX_INDENT));
 
     // 1. A component instance keeps its identity. Do not walk inside it.
     if let Some(inst) = &node.instance {
@@ -719,7 +729,7 @@ fn emit_run(
         return None;
     }
 
-    let pad = "  ".repeat(indent);
+    let pad = "  ".repeat(indent.min(MAX_INDENT));
     let field_names = unique_fields(&slots[0]);
 
     // One text slot maps over plain strings; several map over objects.
@@ -1053,6 +1063,7 @@ mod tests {
             figma_css: None,
             tokens: Default::default(),
             exportable: false,
+            truncated: false,
             interactions: vec![],
             children,
         }

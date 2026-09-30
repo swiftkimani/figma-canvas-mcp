@@ -15,6 +15,95 @@
 use crate::ir::{Direction, Edges, Layout, Node, Placement, Sizing};
 use crate::motion;
 
+/// Strip anything from a CSS value that could end the declaration or the rule.
+///
+/// Several values reach us as free strings from the plugin — `font-family`,
+/// `line-height`, `letter-spacing`, and every key and value of
+/// `getCSSAsync()`. A layer named `Inter"; background: url(...)` would otherwise
+/// inject declarations, and a `}` would close the rule and open a new one.
+/// Figma is unlikely to send these, but "unlikely" is not a security property.
+pub fn css_safe(v: &str) -> String {
+    // A value carrying one of these is not a value we are willing to repair.
+    // Stripping the parenthesis would leave `url http://evil`, which is inert
+    // but meaningless; dropping the declaration is the honest outcome.
+    const POISON: [&str; 5] = [
+        "url(",
+        "@import",
+        "expression(",
+        "javascript:",
+        "image-set(",
+    ];
+    let lowered = v.to_ascii_lowercase();
+    if POISON.iter().any(|p| lowered.contains(p)) {
+        return String::new();
+    }
+
+    v.chars()
+        .filter(|c| {
+            !matches!(
+                c,
+                ';' | '{' | '}' | '"' | '\'' | '\\' | '<' | '>' | '\n' | '\r'
+            )
+        })
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+/// A length or a keyword, or nothing.
+///
+/// `line-height` and `letter-spacing` arrive as free strings, and stripping the
+/// dangerous characters out of `20px; position: fixed` leaves
+/// `20px position: fixed` — inert, because the browser rejects the malformed
+/// value, but it should never have been written at all. These fields have a
+/// known shape, so validate against it rather than trying to repair the input.
+fn css_safe_dimension(v: &str) -> Option<String> {
+    let v = v.trim();
+    if v.is_empty() {
+        return None;
+    }
+    if matches!(v, "normal" | "inherit" | "initial" | "unset" | "auto") {
+        return Some(v.to_string());
+    }
+
+    let (num, unit) = match v.find(|c: char| c.is_alphabetic() || c == '%') {
+        Some(i) => (&v[..i], &v[i..]),
+        None => (v, ""),
+    };
+    if !matches!(
+        unit,
+        "" | "px" | "em" | "rem" | "%" | "pt" | "vh" | "vw" | "ch"
+    ) {
+        return None;
+    }
+    // The numeric part must actually be a number.
+    num.parse::<f64>().ok().map(|n| format!("{n}{unit}"))
+}
+
+/// A font family is a name: letters, digits, spaces and hyphens, nothing else.
+///
+/// Stricter than [`css_safe`] because there is no legitimate font name that
+/// needs punctuation, and this value is interpolated inside quotes.
+fn css_safe_font(v: &str) -> String {
+    v.chars()
+        .filter(|c| c.is_alphanumeric() || matches!(c, ' ' | '-' | '_'))
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+/// A CSS property name is an identifier; anything else is not a property.
+fn css_safe_property(k: &str) -> Option<String> {
+    let cleaned: String = k
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+        .collect();
+    if cleaned.is_empty() || cleaned.starts_with(|c: char| c.is_ascii_digit()) {
+        return None;
+    }
+    Some(cleaned.to_ascii_lowercase())
+}
+
 /// Ordered declarations, so output diffs stay readable.
 pub type Decls = Vec<(String, String)>;
 
@@ -243,10 +332,17 @@ pub fn declarations(node: &Node, parent: Option<&Layout>) -> Decls {
     let mut styled_from_figma = false;
     if let Some(fcss) = &node.figma_css {
         for (k, v) in fcss {
-            if figma_css_is_layout(k) {
+            let Some(prop) = css_safe_property(k) else {
+                continue;
+            };
+            if figma_css_is_layout(&prop) {
                 continue;
             }
-            d.push((k.clone(), v.clone()));
+            let value = css_safe(v);
+            if value.is_empty() {
+                continue;
+            }
+            d.push((prop, value));
             styled_from_figma = true;
         }
     }
@@ -357,7 +453,10 @@ fn appearance(node: &Node, d: &mut Decls) {
 
     if let Some(t) = &node.text {
         if let Some(f) = &t.font_family {
-            d.push(("font-family".into(), format!("\"{f}\"")));
+            let name = css_safe_font(f);
+            if !name.is_empty() {
+                d.push(("font-family".into(), format!("\"{name}\"")));
+            }
         }
         if let Some(v) = t.font_size {
             d.push(("font-size".into(), px(v)));
@@ -365,11 +464,11 @@ fn appearance(node: &Node, d: &mut Decls) {
         if let Some(v) = t.font_weight {
             d.push(("font-weight".into(), format!("{}", v.round() as i64)));
         }
-        if let Some(v) = &t.line_height {
-            d.push(("line-height".into(), v.clone()));
+        if let Some(v) = css_safe_dimension(t.line_height.as_deref().unwrap_or("")) {
+            d.push(("line-height".into(), v));
         }
-        if let Some(v) = &t.letter_spacing {
-            d.push(("letter-spacing".into(), v.clone()));
+        if let Some(v) = css_safe_dimension(t.letter_spacing.as_deref().unwrap_or("")) {
+            d.push(("letter-spacing".into(), v));
         }
         // left is the CSS default, so emitting it is noise.
         if let Some(v) = &t.align
@@ -488,6 +587,7 @@ mod tests {
             figma_css: None,
             tokens: Default::default(),
             exportable: false,
+            truncated: false,
             interactions: vec![],
             children: vec![],
         }

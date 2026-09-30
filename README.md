@@ -6,7 +6,11 @@
 Read a **live Figma canvas** over a local plugin bridge and reconstruct it as code.
 One Rust binary, no Figma API token, no REST rate limit, no Node.js runtime.
 
-Works with **Figma Desktop and Figma in a browser tab**.
+> **Requires the Figma Desktop app.** Figma's browser app has no plugin
+> development mode at all — `Plugins → Development` does not exist there, so a
+> local plugin cannot be imported. Once imported in Desktop, the bridge itself
+> runs fine in a browser tab; but the import is Desktop-only and there is no way
+> around it. See [Which Figma tool to use](#which-figma-tool-to-use).
 
 ```
 ┌──────────────┐  MCP over stdio   ┌──────────────────────┐
@@ -25,6 +29,29 @@ Works with **Figma Desktop and Figma in a browser tab**.
                                    │   your live document │
                                    └──────────────────────┘
 ```
+
+## Which Figma tool to use
+
+Two tools read Figma, and their requirements are **opposite**. Knowing which one
+fits saves a lot of wasted effort:
+
+| | this tool | Figma's own MCP connector |
+|---|---|---|
+| Figma Desktop app | **required** (to import the plugin) | not needed |
+| Edit access to the file | **not needed** — view-only is fine | **required** |
+| Rate limits | none | yes |
+| `getCSSAsync()`, variables on any plan | yes | limited |
+
+So:
+
+- **View-only access to someone else's file, and you have Desktop** → this tool.
+  It runs through the Plugin API, which works on any file you can open.
+- **Edit access, and you want to stay in the browser** → Figma's own connector.
+  No plugin, no Desktop, works immediately.
+- **View-only *and* browser-only** → neither works as-is. Duplicate the file into
+  a team where you are an editor (`File → Duplicate`, then move it), which takes
+  a few seconds in the browser and gives you edit access to your copy. Then use
+  Figma's connector.
 
 ## Quickstart
 

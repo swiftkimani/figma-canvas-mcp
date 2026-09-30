@@ -1,0 +1,19 @@
+//! figma-canvas-mcp — read a live Figma canvas and reconstruct it as code.
+//!
+//! The pipeline, in order:
+//!
+//! 1. [`bridge`] holds a loopback WebSocket that the Figma plugin connects to.
+//! 2. [`raw`] is the projection the plugin sends: Figma API field names, verbatim.
+//! 3. [`ir`] normalizes that into a scene that knows parent/child relationships.
+//! 4. [`css`] turns the IR into declarations, taking layout from the IR and
+//!    appearance from Figma's own `getCSSAsync()`.
+//! 5. [`codegen`] emits React and CSS.
+//! 6. [`tools`] exposes the whole thing as MCP tools.
+
+pub mod bridge;
+pub mod codegen;
+pub mod css;
+pub mod ir;
+pub mod protocol;
+pub mod raw;
+pub mod tools;

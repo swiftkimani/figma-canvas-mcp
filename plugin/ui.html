@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Figma Canvas Bridge</title>
+<style>
+  :root {
+    --bg: #ffffff; --fg: #1e1e1e; --muted: #7a7a7a;
+    --line: #e6e6e6; --ok: #0f9d58; --warn: #d97706; --err: #d93025;
+    --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #2c2c2c; --fg: #eaeaea; --muted: #9b9b9b; --line: #444; }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 14px; background: var(--bg); color: var(--fg);
+    font: 11px/1.5 Inter, -apple-system, system-ui, sans-serif;
+  }
+  .row { display: flex; align-items: center; gap: 8px; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex: 0 0 auto; }
+  .dot.on { background: var(--ok); }
+  .dot.off { background: var(--err); }
+  .dot.wait { background: var(--warn); }
+  h1 { font-size: 12px; margin: 0; font-weight: 600; }
+  p { margin: 8px 0 0; color: var(--muted); }
+  code { font-family: var(--mono); font-size: 10px; }
+  .log {
+    margin-top: 12px; border-top: 1px solid var(--line); padding-top: 8px;
+    font-family: var(--mono); font-size: 10px; color: var(--muted);
+    max-height: 120px; overflow-y: auto; white-space: pre-wrap; word-break: break-word;
+  }
+  .stat { margin-top: 10px; display: grid; grid-template-columns: auto 1fr; gap: 2px 10px; }
+  .stat dt { color: var(--muted); }
+  .stat dd { margin: 0; font-family: var(--mono); font-size: 10px; }
+</style>
+</head>
+<body>
+  <div class="row"><span class="dot wait" id="dot"></span><h1 id="state">Connecting…</h1></div>
+  <p id="hint">Leave this panel open while your AI client works.</p>
+  <dl class="stat">
+    <dt>Server</dt><dd id="url">—</dd>
+    <dt>Requests</dt><dd id="count">0</dd>
+    <dt>Selection</dt><dd id="sel">0</dd>
+  </dl>
+  <div class="log" id="log"></div>
+
+<script>
+// The plugin sandbox has no network access, so this iframe owns the socket and
+// relays to the sandbox over postMessage. That indirection is also why this works
+// identically in Figma Desktop and in a browser tab.
+var PORT = 18765;
+var URL_ = 'ws://127.0.0.1:' + PORT;
+var ws = null, attempt = 0, served = 0;
+
+var $ = function (id) { return document.getElementById(id); };
+$('url').textContent = URL_;
+
+function log(msg) {
+  var el = $('log');
+  var t = new Date().toTimeString().slice(0, 8);
+  el.textContent = (t + '  ' + msg + '\n' + el.textContent).slice(0, 4000);
+}
+
+function setState(cls, text, hint) {
+  $('dot').className = 'dot ' + cls;
+  $('state').textContent = text;
+  if (hint) $('hint').textContent = hint;
+}
+
+function connect() {
+  try {
+    ws = new WebSocket(URL_);
+  } catch (e) {
+    log('cannot open socket: ' + e.message);
+    return retry();
+  }
+
+  ws.onopen = function () {
+    attempt = 0;
+    setState('on', 'Connected', 'Leave this panel open while your AI client works.');
+    log('connected to ' + URL_);
+    // Ask the sandbox to introduce itself.
+    parent.postMessage({ pluginMessage: { kind: 'hello-please' } }, '*');
+  };
+
+  ws.onmessage = function (ev) {
+    var req;
+    try {
+      req = JSON.parse(ev.data);
+    } catch (e) {
+      return log('undecodable frame from server');
+    }
+    served++;
+    $('count').textContent = served;
+    log('→ ' + req.op);
+    // Hand the request to the sandbox, which has the Figma API.
+    parent.postMessage({ pluginMessage: { kind: 'request', request: req } }, '*');
+  };
+
+  ws.onclose = function () {
+    setState('off', 'Disconnected', 'Start figma-canvas-mcp, or check the port.');
+    retry();
+  };
+
+  ws.onerror = function () {
+    // onclose always follows, so reconnection is handled there.
+    log('socket error');
+  };
+}
+
+function retry() {
+  attempt++;
+  var wait = Math.min(1000 * Math.pow(1.6, attempt), 15000);
+  setState('wait', 'Reconnecting…', 'Retrying in ' + Math.round(wait / 1000) + 's.');
+  setTimeout(connect, wait);
+}
+
+// Sandbox -> iframe -> server.
+window.onmessage = function (event) {
+  var msg = event.data && event.data.pluginMessage;
+  if (!msg) return;
+
+  if (msg.kind === 'selection') {
+    $('sel').textContent = msg.nodeIds.length;
+  }
+  if (msg.kind === 'log') {
+    log(msg.message);
+  }
+  if (!ws || ws.readyState !== 1) return;
+  if (msg.kind === 'send') {
+    ws.send(JSON.stringify(msg.payload));
+  }
+};
+
+connect();
+</script>
+</body>
+</html>

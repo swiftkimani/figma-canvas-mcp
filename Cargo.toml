@@ -2,7 +2,6 @@
 name = "figma-canvas-mcp"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
 description = "MCP server that reads a live Figma canvas over a local plugin bridge and reconstructs it as code"
 license = "MIT"
 repository = "https://github.com/swiftkimani/figma-canvas-mcp"

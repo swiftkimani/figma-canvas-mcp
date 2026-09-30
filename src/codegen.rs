@@ -12,7 +12,9 @@ use serde::{Deserialize, Serialize};
 use crate::css::{self, Decls};
 use crate::ir::{Layout, Node, Token, pascal_case};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema,
+)]
 #[serde(rename_all = "kebab-case")]
 pub enum StyleMode {
     /// A `.module.css` file with semantic class names.
@@ -63,11 +65,7 @@ impl Ctx {
         };
         let n = self.used.entry(base.clone()).or_insert(0);
         *n += 1;
-        if *n == 1 {
-            base
-        } else {
-            format!("{base}-{n}")
-        }
+        if *n == 1 { base } else { format!("{base}-{n}") }
     }
 }
 
@@ -275,7 +273,7 @@ fn emit(
             if is_root {
                 merge(format!("\"{joined}\""))
             } else {
-                format!(" className=\"{joined}\"", )
+                format!(" className=\"{joined}\"",)
             }
         }
     };
@@ -298,10 +296,7 @@ fn emit(
         .map(|c| emit(c, Some(&node.layout), ctx, indent + 1, false))
         .collect();
 
-    format!(
-        "{pad}<div{attr}>\n{}\n{pad}</div>",
-        inner.join("\n")
-    )
+    format!("{pad}<div{attr}>\n{}\n{pad}</div>", inner.join("\n"))
 }
 
 /// Guess a semantic tag from the layer name and type size.
@@ -575,7 +570,11 @@ mod tests {
     fn duplicate_layer_names_get_unique_classes() {
         let root = frame(
             "Root",
-            vec![frame("row", vec![]), frame("row", vec![]), frame("row", vec![])],
+            vec![
+                frame("row", vec![]),
+                frame("row", vec![]),
+                frame("row", vec![]),
+            ],
         );
         let g = generate(&root, &[], StyleMode::CssModules, None);
         let sheet = &g.files[1].contents;
@@ -599,20 +598,18 @@ mod tests {
 
     #[test]
     fn tokens_become_a_themed_stylesheet() {
-        let tokens = vec![
-            Token {
-                id: "V:1".into(),
-                name: "color/brand/primary".into(),
-                css_var: "--color-brand-primary".into(),
-                kind: "COLOR".into(),
-                collection: Some("Palette".into()),
-                values_by_mode: BTreeMap::from([
-                    ("Light".to_string(), "#0d99ff".to_string()),
-                    ("Dark".to_string(), "#7cc4ff".to_string()),
-                ]),
-                description: None,
-            },
-        ];
+        let tokens = vec![Token {
+            id: "V:1".into(),
+            name: "color/brand/primary".into(),
+            css_var: "--color-brand-primary".into(),
+            kind: "COLOR".into(),
+            collection: Some("Palette".into()),
+            values_by_mode: BTreeMap::from([
+                ("Light".to_string(), "#0d99ff".to_string()),
+                ("Dark".to_string(), "#7cc4ff".to_string()),
+            ]),
+            description: None,
+        }];
         let g = generate(&frame("Root", vec![]), &tokens, StyleMode::CssModules, None);
         let css = g
             .files
@@ -620,7 +617,9 @@ mod tests {
             .find(|f| f.path == "tokens.css")
             .expect("tokens.css emitted");
         assert!(css.contents.contains("--color-brand-primary: #0d99ff;"));
-        assert!(css.contents.contains("[data-theme=\"light\"]") || css.contents.contains(":root {"));
+        assert!(
+            css.contents.contains("[data-theme=\"light\"]") || css.contents.contains(":root {")
+        );
         assert!(css.contents.contains("#7cc4ff"));
     }
 

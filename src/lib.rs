@@ -17,3 +17,10 @@ pub mod ir;
 pub mod protocol;
 pub mod raw;
 pub mod tools;
+
+/// Default port for the plugin bridge.
+///
+/// This value is duplicated in `plugin/manifest.json` (`networkAccess.allowedDomains`)
+/// and `plugin/ui.html` (`var PORT`), because Figma's manifest cannot read Rust
+/// constants. `tests/plugin_consistency.rs` fails if they drift apart.
+pub const DEFAULT_BRIDGE_PORT: u16 = 18765;

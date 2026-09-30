@@ -202,9 +202,7 @@ impl FigmaServer {
         }
         let summary: Vec<Value> = nodes
             .iter()
-            .map(|n| {
-                json!({ "id": n.id, "name": n.name, "nodes": n.count(), "depth": n.depth() })
-            })
+            .map(|n| json!({ "id": n.id, "name": n.name, "nodes": n.count(), "depth": n.depth() }))
             .collect();
         Ok(format!(
             "{}\n\n{}",
@@ -236,9 +234,11 @@ impl FigmaServer {
     async fn get_tokens(&self) -> Result<String, ErrorData> {
         let tokens = self.tokens().await?;
         if tokens.is_empty() {
-            return Ok("This file defines no variables. Colours and spacing will be emitted as \
+            return Ok(
+                "This file defines no variables. Colours and spacing will be emitted as \
                        literal values."
-                .into());
+                    .into(),
+            );
         }
         let css = codegen::generate(
             &ir::Node {
@@ -274,7 +274,11 @@ impl FigmaServer {
             .map(|f| f.contents.clone())
             .unwrap_or_default();
 
-        Ok(format!("{}\n\n--- tokens.css ---\n{}", pretty(&tokens)?, sheet))
+        Ok(format!(
+            "{}\n\n--- tokens.css ---\n{}",
+            pretty(&tokens)?,
+            sheet
+        ))
     }
 
     /// Component identity, so generated JSX references components.
@@ -437,7 +441,7 @@ impl ServerHandler for FigmaServer {
         me.version = env!("CARGO_PKG_VERSION").into();
         info.server_info = me;
         info.instructions = Some(
-                "Reads a live Figma canvas through a local plugin bridge and reconstructs it as \
+            "Reads a live Figma canvas through a local plugin bridge and reconstructs it as \
                  code. Works with Figma Desktop and Figma in a browser tab.\n\n\
                  Start with figma_status to confirm the plugin is attached. Then get_selection to \
                  orient, read_scene for the structural model, and generate_code for React output. \

@@ -4,14 +4,13 @@
 //! WebSocket that a small Figma plugin connects to. No Figma API token, no REST
 //! rate limit, no Node.js runtime.
 
-use figma_canvas_mcp::{bridge, tools};
+use figma_canvas_mcp::{DEFAULT_BRIDGE_PORT, bridge, tools};
 
 use std::path::PathBuf;
 use std::time::Duration;
 
 use rmcp::{ServiceExt, transport::stdio};
 
-const DEFAULT_PORT: u16 = 18765;
 const HELP: &str = "\
 figma-canvas-mcp — read a live Figma canvas over a local plugin bridge
 
@@ -44,7 +43,7 @@ impl Default for Args {
     fn default() -> Self {
         Self {
             host: "127.0.0.1".into(),
-            port: DEFAULT_PORT,
+            port: DEFAULT_BRIDGE_PORT,
             out_dir: PathBuf::from("figma-out"),
             timeout: Duration::from_secs(30),
         }
@@ -55,10 +54,7 @@ fn parse_args() -> Result<Args, String> {
     let mut args = Args::default();
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
-        let mut value = || {
-            it.next()
-                .ok_or_else(|| format!("{flag} expects a value"))
-        };
+        let mut value = || it.next().ok_or_else(|| format!("{flag} expects a value"));
         match flag.as_str() {
             "-h" | "--help" => {
                 print!("{HELP}");

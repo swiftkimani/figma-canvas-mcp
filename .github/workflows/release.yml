@@ -1,0 +1,100 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build (e.g. v0.1.0)'
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Native runners only — no cross-compilation toolchains to go stale.
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-13
+            target: x86_64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Verify the binary answers an MCP handshake
+        shell: bash
+        run: |
+          BIN=target/${{ matrix.target }}/release/figma-canvas-mcp
+          [ -f "$BIN.exe" ] && BIN="$BIN.exe"
+          "$BIN" --version
+          printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2026-07-28","capabilities":{},"clientInfo":{"name":"release","version":"0"}}}' \
+            | "$BIN" --port 0 2>/dev/null | grep -q '"figma-canvas-mcp"'
+          echo "handshake OK"
+
+      - name: Package
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME:-${{ github.event.inputs.tag }}}"
+          STAGE="figma-canvas-mcp-${VERSION}-${{ matrix.target }}"
+          mkdir -p "$STAGE/plugin"
+          cp README.md LICENSE "$STAGE/"
+          cp plugin/manifest.json plugin/code.js plugin/ui.html "$STAGE/plugin/"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp "target/${{ matrix.target }}/release/figma-canvas-mcp.exe" "$STAGE/"
+            7z a "$STAGE.zip" "$STAGE" >/dev/null
+            echo "ASSET=$STAGE.zip" >> "$GITHUB_ENV"
+          else
+            cp "target/${{ matrix.target }}/release/figma-canvas-mcp" "$STAGE/"
+            tar czf "$STAGE.tar.gz" "$STAGE"
+            echo "ASSET=$STAGE.tar.gz" >> "$GITHUB_ENV"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: ${{ env.ASSET }}
+          if-no-files-found: error
+
+  publish:
+    name: attach to release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: List what is being published
+        run: ls -lh dist
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          body: |
+            Each archive contains the `figma-canvas-mcp` binary plus the `plugin/`
+            directory to import into Figma via
+            **Plugins → Development → Import plugin from manifest…**
+
+            See the README for MCP client configuration.

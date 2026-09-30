@@ -1,5 +1,8 @@
 # figma-canvas-mcp
 
+[![CI](https://github.com/swiftkimani/figma-canvas-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/swiftkimani/figma-canvas-mcp/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 Read a **live Figma canvas** over a local plugin bridge and reconstruct it as code.
 One Rust binary, no Figma API token, no REST rate limit, no Node.js runtime.
 
@@ -50,12 +53,18 @@ build step. Figma loads `code.js` as-is.
 
 ## Install
 
+Needs a recent stable Rust (the crate uses edition 2024).
+
 ```bash
 git clone https://github.com/swiftkimani/figma-canvas-mcp
 cd figma-canvas-mcp
 cargo build --release
 # binary at ./target/release/figma-canvas-mcp
 ```
+
+Or grab a prebuilt binary for Linux, macOS (Intel and Apple Silicon) or Windows
+from [Releases](https://github.com/swiftkimani/figma-canvas-mcp/releases) — each
+archive bundles the `plugin/` directory too.
 
 ### 1. Register the server with your MCP client
 
@@ -186,12 +195,24 @@ there, or terminate TLS locally.
 ## Development
 
 ```bash
-cargo test          # 26 tests: unit + a full end-to-end bridge round-trip
-cargo clippy
+cargo test                                      # 36 tests
+cargo clippy --all-targets -- -D warnings
+cargo fmt --all --check
+node --check plugin/code.js                     # syntax only; not a dependency
 ```
 
-`tests/bridge_roundtrip.rs` drives the real WebSocket server with a fake plugin, so
-the wire protocol, IR and codegen are all covered without Figma running.
+Four layers of test, all run by CI on Linux, macOS and Windows:
+
+| Suite | What it covers |
+|---|---|
+| unit (20) | The layout mapping and codegen rules, including a test that fails if `getCSSAsync()` ever overrides the IR's layout |
+| `tests/bridge_roundtrip.rs` (6) | The real WebSocket server driven by a fake plugin — wire protocol, IR and codegen end to end, without Figma |
+| `tests/plugin_consistency.rs` (7) | Rust/plugin drift: port agreement across `main.rs`, `manifest.json` and `ui.html`; every op the server calls exists in the plugin and none are dead; no synchronous Figma APIs under `documentAccess: dynamic-page` |
+| `tests/mcp_stdio.rs` (3) | A real `initialize` / `tools/list` / `tools/call` handshake against the compiled binary, asserting stdout is clean JSON-RPC |
+
+The drift guards exist because those mismatches fail *silently at runtime* — a
+stale port is a socket that never opens, and Figma reports a plugin syntax error as
+a blank panel with an empty console.
 
 ## A note on scope
 

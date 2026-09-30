@@ -139,7 +139,9 @@ async fn fake_plugin(addr: std::net::SocketAddr) {
         } else {
             json!({ "type": "response", "id": id, "ok": true, "result": result })
         };
-        ws.send(Message::Text(reply.to_string().into())).await.unwrap();
+        ws.send(Message::Text(reply.to_string().into()))
+            .await
+            .unwrap();
     }
 }
 
@@ -200,7 +202,12 @@ async fn scene_round_trips_into_the_ir() {
 
     // Vertical auto layout became column flex with the designer's gap.
     match &node.layout {
-        ir::Layout::Flex { direction, gap, align, .. } => {
+        ir::Layout::Flex {
+            direction,
+            gap,
+            align,
+            ..
+        } => {
             assert_eq!(*direction, ir::Direction::Column);
             assert_eq!(*gap, 16.0);
             assert_eq!(*align, ir::Align::Center);
@@ -233,8 +240,7 @@ async fn full_pipeline_generates_usable_react() {
     let scene = ir::build(&roots[0]);
 
     let raw_vars = bridge.call("variables", json!({})).await.unwrap();
-    let vars: Vec<figma_canvas_mcp::raw::RawVariable> =
-        serde_json::from_value(raw_vars).unwrap();
+    let vars: Vec<figma_canvas_mcp::raw::RawVariable> = serde_json::from_value(raw_vars).unwrap();
     let tokens: Vec<ir::Token> = vars.into_iter().map(ir::Token::from).collect();
 
     let out = codegen::generate(&scene, &tokens, StyleMode::CssModules, None);
@@ -285,7 +291,10 @@ async fn full_pipeline_generates_usable_react() {
         sheet.contains("align-self: stretch;"),
         "FILL on the cross axis should stretch, got:\n{sheet}"
     );
-    assert!(!sheet.contains("width: 272px"), "FILL leaked a fixed width:\n{sheet}");
+    assert!(
+        !sheet.contains("width: 272px"),
+        "FILL leaked a fixed width:\n{sheet}"
+    );
 
     // The fixed-size instance keeps its placement, passed to the component via
     // className, so it cannot be squashed by the flex container.
@@ -303,7 +312,10 @@ async fn full_pipeline_generates_usable_react() {
     assert!(!sheet.contains("left: 0px;"), "{sheet}");
 
     // Print the full output once so `cargo test -- --nocapture` shows what ships.
-    println!("=== {} ===\n{tsx}\n=== stylesheet ===\n{sheet}", out.component_name);
+    println!(
+        "=== {} ===\n{tsx}\n=== stylesheet ===\n{sheet}",
+        out.component_name
+    );
 
     // Token reference with the literal as a fallback.
     assert!(
@@ -312,7 +324,10 @@ async fn full_pipeline_generates_usable_react() {
     );
 
     // Tokens carry both modes, so theming works.
-    assert!(tokens_css.contains("--color-surface-raised: #ffffff;"), "{tokens_css}");
+    assert!(
+        tokens_css.contains("--color-surface-raised: #ffffff;"),
+        "{tokens_css}"
+    );
     assert!(tokens_css.contains("#1e1e1e"), "{tokens_css}");
     assert!(tokens_css.contains("--space-md: 16px;"), "{tokens_css}");
 }

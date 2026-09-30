@@ -109,10 +109,12 @@ impl Bridge {
     /// bound. Port 0 yields an OS-assigned port, which is what tests use.
     pub async fn bind(host: &str, port: u16) -> anyhow::Result<(TcpListener, SocketAddr)> {
         let requested = format!("{host}:{port}");
-        let listener = TcpListener::bind(&requested)
-            .await
-            .with_context(|| format!("could not bind {requested} (is another instance running?)"))?;
-        let addr = listener.local_addr().context("listener has no local address")?;
+        let listener = TcpListener::bind(&requested).await.with_context(|| {
+            format!("could not bind {requested} (is another instance running?)")
+        })?;
+        let addr = listener
+            .local_addr()
+            .context("listener has no local address")?;
         Ok((listener, addr))
     }
 
@@ -255,7 +257,11 @@ impl Bridge {
                 self.inner.pending.lock().await.remove(&id);
                 return Err(BridgeError::NotConnected);
             };
-            if session.outbound.send(Message::Text(payload.into())).is_err() {
+            if session
+                .outbound
+                .send(Message::Text(payload.into()))
+                .is_err()
+            {
                 self.inner.pending.lock().await.remove(&id);
                 return Err(BridgeError::NotConnected);
             }

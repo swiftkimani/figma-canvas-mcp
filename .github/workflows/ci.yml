@@ -1,0 +1,89 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A new push to the same branch supersedes the previous run.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    name: fmt + clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Formatting
+        run: cargo fmt --all --check
+      - name: Clippy (warnings are errors)
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+  test:
+    name: test / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # One platform failing should not hide the others.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test
+        # Covers the unit tests, the WebSocket round-trip, the Rust/plugin drift
+        # guards, and a real MCP handshake against the compiled binary.
+        run: cargo test --all-targets --verbose
+
+  plugin:
+    name: plugin
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Syntax-check the plugin
+        # Node is a linter here, not a dependency: Figma loads this file itself,
+        # and it reports syntax errors as a blank panel with an empty console.
+        run: node --check plugin/code.js
+      - name: Check the UI iframe parses as HTML with a script block
+        run: |
+          node -e '
+            const fs = require("fs");
+            const html = fs.readFileSync("plugin/ui.html", "utf8");
+            if (!html.includes("<script>")) throw new Error("ui.html has no script block");
+            const body = html.split("<script>")[1].split("</script>")[0];
+            new Function(body);
+            console.log("ui.html script block parses");
+          '
+      - name: Validate the manifest
+        run: |
+          node -e '
+            const m = require("./plugin/manifest.json");
+            for (const k of ["name","id","api","main","ui","networkAccess"]) {
+              if (!m[k]) throw new Error("manifest.json missing " + k);
+            }
+            for (const f of [m.main, m.ui]) {
+              require("fs").accessSync("plugin/" + f);
+            }
+            const d = m.networkAccess.allowedDomains || [];
+            if (!d.length) throw new Error("no allowedDomains");
+            for (const origin of d) {
+              if (!/127\.0\.0\.1|localhost/.test(origin)) {
+                throw new Error("non-loopback origin allowed: " + origin);
+              }
+            }
+            console.log("manifest.json valid;", d.length, "loopback origin(s)");
+          '

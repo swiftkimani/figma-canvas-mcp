@@ -292,7 +292,10 @@ fn appearance(node: &Node, d: &mut Decls) {
     }
 
     if let (Some(w), Some(stroke)) = (s.stroke_width, s.strokes.first()) {
-        d.push(("border".into(), format!("{} solid {}", px(w), stroke.css_value())));
+        d.push((
+            "border".into(),
+            format!("{} solid {}", px(w), stroke.css_value()),
+        ));
     }
 
     if !s.radius.is_zero() {
@@ -617,7 +620,11 @@ mod tests {
         let d = declarations(&n, Some(&parent));
         assert_eq!(get(&d, "width"), None, "layout must come from the IR");
         assert_eq!(get(&d, "flex"), Some("1 1 0%"));
-        assert_eq!(get(&d, "border-radius"), Some("12px"), "visuals come from Figma");
+        assert_eq!(
+            get(&d, "border-radius"),
+            Some("12px"),
+            "visuals come from Figma"
+        );
     }
 
     #[test]

@@ -791,8 +791,16 @@ mod tests {
             kind: "FRAME".into(),
             visible: true,
             children: vec![
-                RawNode { id: "a".into(), visible: false, ..Default::default() },
-                RawNode { id: "b".into(), visible: true, ..Default::default() },
+                RawNode {
+                    id: "a".into(),
+                    visible: false,
+                    ..Default::default()
+                },
+                RawNode {
+                    id: "b".into(),
+                    visible: true,
+                    ..Default::default()
+                },
             ],
             ..Default::default()
         };

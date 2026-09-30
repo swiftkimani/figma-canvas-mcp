@@ -16,29 +16,59 @@ use crate::bridge::Bridge;
 use crate::codegen::{self, StyleMode};
 use crate::ir::{self, Token};
 use crate::motion::{self, Action, Interaction};
+use crate::outline::{self, Budget};
 use crate::raw::{RawNode, RawVariable};
 
 fn bad(msg: impl Into<String>) -> ErrorData {
     ErrorData::internal_error(msg.into(), None)
 }
 
+/// Serialize for a model's context window.
+///
+/// Indentation is roughly half the bytes of a deeply nested payload, so anything
+/// large is emitted compact. Small results stay pretty, where legibility is free.
 fn pretty<T: Serialize>(v: &T) -> Result<String, ErrorData> {
+    let compact =
+        serde_json::to_string(v).map_err(|e| bad(format!("could not serialize result: {e}")))?;
+    if compact.len() > PRETTY_LIMIT {
+        return Ok(compact);
+    }
     serde_json::to_string_pretty(v).map_err(|e| bad(format!("could not serialize result: {e}")))
 }
+
+/// Above this many bytes, drop the indentation.
+const PRETTY_LIMIT: usize = 2048;
 
 // ---------------------------------------------------------------------------
 // Tool parameters
 // ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum Detail {
+    /// One line per node: ids, nesting, layout, sizing, components, text.
+    /// A small fraction of `full`'s size, and enough to decide what to inspect.
+    #[default]
+    Outline,
+    /// The complete scene model as JSON. Use on a subtree, not a whole page.
+    Full,
+}
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ReadSceneArgs {
     /// Figma node ids to read. Omit to use the current selection in Figma.
     #[serde(default)]
     pub node_ids: Option<Vec<String>>,
-    /// How deep to walk. Default 12. Lower this on very large frames.
+    /// "outline" (default, cheap) or "full" (complete JSON, expensive).
+    #[serde(default)]
+    pub detail: Option<Detail>,
+    /// Levels to show. Default 12.
     #[serde(default)]
     pub depth: Option<u32>,
-    /// Also fetch Figma's own getCSSAsync() output per node. Slower but exact.
+    /// Cap on nodes returned. Default 300; the result says what was omitted.
+    #[serde(default)]
+    pub max_nodes: Option<u32>,
+    /// Also fetch Figma's own getCSSAsync() per node. Exact, but much larger.
     #[serde(default)]
     pub include_css: Option<bool>,
 }
@@ -181,35 +211,48 @@ impl FigmaServer {
 
     /// The reconstruction: a normalized, code-ready model of the canvas.
     #[tool(
-        description = "Read the canvas as a normalized scene tree: geometry, auto-layout resolved \
-                       to flexbox semantics, fills and strokes with their design-token names, \
-                       text content and style, and component/variant identity for instances. This \
-                       is the accurate reconstruction — use it instead of reasoning from a \
-                       screenshot."
+        description = "Read the canvas: nesting, auto-layout as flexbox semantics, sizing, \
+                       token-named paint, text, and component/variant identity. Defaults to a \
+                       cheap one-line-per-node outline; pass detail=\"full\" with node_ids for \
+                       the complete model of one subtree. Use this instead of a screenshot."
     )]
     async fn read_scene(
         &self,
         Parameters(args): Parameters<ReadSceneArgs>,
     ) -> Result<String, ErrorData> {
-        let nodes = self
-            .scene(
-                args.node_ids,
-                args.depth.unwrap_or(12),
-                args.include_css.unwrap_or(false),
-            )
-            .await?;
+        let detail = args.detail.unwrap_or_default();
+        let depth = args.depth.unwrap_or(12);
+        // getCSSAsync roughly triples the payload and the outline never shows
+        // per-node CSS, so it is ignored there rather than silently paid for.
+        let include_css = args.include_css.unwrap_or(false) && detail == Detail::Full;
+
+        let nodes = self.scene(args.node_ids, depth, include_css).await?;
         if nodes.is_empty() {
             return Ok("Nothing to read. Select a frame in Figma, or pass node_ids.".into());
         }
-        let summary: Vec<Value> = nodes
-            .iter()
-            .map(|n| json!({ "id": n.id, "name": n.name, "nodes": n.count(), "depth": n.depth() }))
-            .collect();
-        Ok(format!(
-            "{}\n\n{}",
-            serde_json::to_string(&json!({ "roots": summary })).unwrap_or_default(),
-            pretty(&nodes)?
-        ))
+
+        match detail {
+            Detail::Outline => Ok(outline::render(
+                &nodes,
+                &Budget {
+                    max_nodes: args.max_nodes.unwrap_or(300) as usize,
+                    max_depth: depth as usize,
+                },
+            )),
+            Detail::Full => {
+                let total: usize = nodes.iter().map(|n| n.count()).sum();
+                // Warn rather than silently burn someone's context window.
+                let note = if total > 120 {
+                    format!(
+                        "Note: {total} nodes. detail=\"outline\", a narrower node_ids, \
+                         or a smaller depth costs far less.\n\n"
+                    )
+                } else {
+                    String::new()
+                };
+                Ok(format!("{note}{}", pretty(&nodes)?))
+            }
+        }
     }
 
     /// Figma's own CSS, not our guess at it.

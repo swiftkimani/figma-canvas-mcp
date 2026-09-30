@@ -184,10 +184,13 @@ pub struct Fill {
     /// CSS-ready value: `#0d99ff`, `rgb(13 153 255 / 0.5)`, or a `linear-gradient(...)`.
     pub value: String,
     /// The Figma variable name, if bound — e.g. `color/brand/primary`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
     /// `--color-brand-primary`, derived from `token`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub css_var: Option<String>,
     pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_hash: Option<String>,
 }
 
@@ -215,28 +218,46 @@ pub struct Shadow {
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Style {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fills: Vec<Fill>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub strokes: Vec<Fill>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stroke_width: Option<f64>,
+    #[serde(default, skip_serializing_if = "Radius::is_zero")]
     pub radius: Radius,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub shadows: Vec<Shadow>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blur: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub opacity: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rotation: Option<f64>,
+    #[serde(default, skip_serializing_if = "is_false")]
     pub clip: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Text {
     pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub font_family: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub font_size: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub font_weight: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub line_height: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub letter_spacing: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub align: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transform: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decoration: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub style_name: Option<String>,
 }
 
@@ -246,9 +267,12 @@ pub struct Text {
 pub struct Instance {
     /// The component set name when it has variants, else the component name.
     pub component: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub component_id: Option<String>,
     /// Variant and exposed props, already keyed for JSX.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub props: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "is_false")]
     pub from_library: bool,
 }
 
@@ -265,23 +289,37 @@ pub struct Node {
     pub name: String,
     /// Figma node type, verbatim: FRAME, TEXT, INSTANCE, RECTANGLE, VECTOR, ...
     pub kind: String,
+    #[serde(default = "default_true_bool", skip_serializing_if = "is_true")]
     pub visible: bool,
     pub width: f64,
     pub height: f64,
     pub layout: Layout,
     pub placement: Placement,
+    #[serde(default, skip_serializing_if = "Edges::is_zero")]
     pub padding: Edges,
+    #[serde(default, skip_serializing_if = "is_default_style")]
     pub style: Style,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<Text>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instance: Option<Instance>,
     /// Figma's own `getCSSAsync()` output, when requested.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub figma_css: Option<BTreeMap<String, String>>,
     /// Token bindings by Figma property name.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub tokens: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "is_false")]
     pub exportable: bool,
     /// Prototype interactions declared on this node, with motion resolved.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub interactions: Vec<Interaction>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub children: Vec<Node>,
+}
+
+fn default_true_bool() -> bool {
+    true
 }
 
 impl Node {
@@ -386,6 +424,24 @@ pub fn pascal_case(s: &str) -> String {
         out.insert(0, 'C');
     }
     out
+}
+
+// --- serialization helpers -------------------------------------------------
+//
+// The IR is serialized into a model's context window, where every `"x": null`
+// costs tokens someone is paying for. A 150-node screen emits roughly 1,400
+// null fields, so these skips are not cosmetic.
+
+fn is_true(b: &bool) -> bool {
+    *b
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+fn is_default_style(s: &Style) -> bool {
+    s == &Style::default()
 }
 
 // ---------------------------------------------------------------------------

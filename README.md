@@ -103,7 +103,7 @@ It reconnects on its own, so a Figma reload or a browser refresh needs no restar
 |---|---|
 | `figma_status` | Whether the plugin is attached, Desktop vs browser, file, selection |
 | `get_selection` | id / name / type / size of what is selected — cheap orientation |
-| `read_scene` | The reconstruction: geometry, layout semantics, paint, text, tokens, component identity |
+| `read_scene` | The reconstruction. Cheap outline by default; `detail="full"` for one subtree |
 | `get_css` | Figma's own `getCSSAsync()` output per node |
 | `get_tokens` | Variables as design tokens, plus a ready `tokens.css` with every mode |
 | `get_components` | Which component each instance came from, and its variant values |
@@ -142,6 +142,53 @@ Two rules drive this:
    They emit `<Button variant="primary" size="md" />` with placement passed through
    `className`, because placement is the caller's decision while paint is the
    component's.
+
+## Token cost
+
+Designed for small context windows, because most people are not on a large one.
+A free-tier model, OpenCode, or a local model has a window this tool can exhaust
+in a single careless call — so it does not make careless calls.
+
+Measured on an ordinary 151-node screen (a 50-row settings list):
+
+| | tokens |
+|---|---|
+| naive full tree, pretty-printed | ~55,600 |
+| after dropping empty fields | ~28,800 |
+| compact JSON | ~13,300 |
+| **outline — the default** | **~2,760** |
+
+A 20× reduction, and the outline still carries every node id, the nesting, sizing,
+token names and text, so drilling into one branch is one cheap follow-up call.
+
+Three things get it there:
+
+1. **Progressive disclosure.** `read_scene` defaults to `detail="outline"` — one
+   line per node. `detail="full"` exists for a subtree you have already chosen,
+   and warns when you point it at something large.
+   ```
+   1:1 Settings list · FRAME 320×800 · col gap12 p16
+     10:0 Row item 0 · FRAME 280×48 · row gap8 between/center p8,12 · w:fill h:hug · bg:color/surface/subtle
+       10:0a Label · TEXT 120×20 · "Item number 0"
+       10:0b Chevron · VECTOR 16×16 · →export
+   ```
+2. **Nothing empty is serialized.** A 151-node tree was emitting ~1,400 `null`
+   fields, 654 empty arrays and 151 empty objects. Now none.
+3. **Hard budgets with honest truncation.** `max_nodes` (300) and `depth` cap the
+   output, and the result says how many nodes it omitted and how to get them.
+   A 1,500-node frame still returns under 8k tokens.
+
+Other costs, deliberately kept down:
+
+- **The per-request floor is ~1,500 tokens** for the instructions plus all nine
+  tool schemas. That ships with every request, so it is budgeted and tested.
+- **`getCSSAsync()` roughly triples the payload**, so it is opt-in, and it is
+  ignored in outline mode rather than silently paid for.
+- **`generate_code` needs no `read_scene` first.** One call, not two.
+- **JSON is compacted above 2 KB**, where indentation stops being worth its bytes.
+
+All of this is enforced by `tests/token_budget.rs`, so a change that reintroduces
+a verbose default fails CI rather than quietly costing someone their window.
 
 ## Motion
 
@@ -242,7 +289,7 @@ WebSockets — use Figma Desktop there, or terminate TLS locally.
 ## Development
 
 ```bash
-cargo test                                      # 44 tests
+cargo test                                      # 49 tests
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all --check
 node --check plugin/code.js                     # syntax only; not a dependency
@@ -252,10 +299,11 @@ Four layers of test, all run by CI on Linux, macOS and Windows:
 
 | Suite | What it covers |
 |---|---|
-| unit (27) | The layout mapping, codegen rules, and motion — including a test that fails if `getCSSAsync()` ever overrides the IR's layout, and one asserting an underdamped spring actually overshoots while an overdamped one does not |
+| unit (31) | The layout mapping, codegen rules, and motion — including a test that fails if `getCSSAsync()` ever overrides the IR's layout, and one asserting an underdamped spring actually overshoots while an overdamped one does not |
 | `tests/bridge_roundtrip.rs` (7) | The real WebSocket server driven by a fake plugin — wire protocol, IR, motion and codegen end to end, without Figma |
 | `tests/plugin_consistency.rs` (7) | Rust/plugin drift: port agreement across `main.rs`, `manifest.json` and `ui.html`; every op the server calls exists in the plugin and none are dead; no synchronous Figma APIs under `documentAccess: dynamic-page` |
 | `tests/mcp_stdio.rs` (3) | A real `initialize` / `tools/list` / `tools/call` handshake against the compiled binary, asserting stdout is clean JSON-RPC |
+| `tests/token_budget.rs` (5) | Enforced token budgets on a realistic 151-node screen, plus the per-request schema floor |
 
 The drift guards exist because those mismatches fail *silently at runtime* — a
 stale port is a socket that never opens, and Figma reports a plugin syntax error as

@@ -15,6 +15,7 @@ pub mod codegen;
 pub mod css;
 pub mod ir;
 pub mod motion;
+pub mod outline;
 pub mod protocol;
 pub mod raw;
 pub mod tools;

@@ -441,6 +441,23 @@ impl Node {
         }
     }
 
+    /// Every component this subtree instantiates, by JSX tag name.
+    pub fn component_names(&self) -> std::collections::BTreeSet<String> {
+        let mut out = std::collections::BTreeSet::new();
+        self.collect_components(&mut out);
+        out
+    }
+
+    fn collect_components(&self, out: &mut std::collections::BTreeSet<String>) {
+        if let Some(i) = &self.instance {
+            out.insert(i.tag());
+            return; // instances are not walked into
+        }
+        for c in &self.children {
+            c.collect_components(out);
+        }
+    }
+
     /// Does this subtree declare any prototype interaction?
     pub fn has_interactions(&self) -> bool {
         !self.interactions.is_empty() || self.children.iter().any(Node::has_interactions)

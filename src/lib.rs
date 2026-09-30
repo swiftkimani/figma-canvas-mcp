@@ -14,6 +14,7 @@ pub mod bridge;
 pub mod codegen;
 pub mod css;
 pub mod ir;
+pub mod lsp;
 pub mod motion;
 pub mod outline;
 pub mod protocol;

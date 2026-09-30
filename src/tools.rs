@@ -6,6 +6,10 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+
+use tokio::sync::Mutex as AsyncMutex;
 
 use base64::Engine as _;
 use rmcp::handler::server::wrapper::Parameters;
@@ -16,6 +20,7 @@ use serde_json::{Value, json};
 use crate::bridge::Bridge;
 use crate::codegen::{self, StyleMode};
 use crate::ir::{self, Token};
+use crate::lsp::{self, LspClient};
 use crate::motion::{self, Action, Interaction};
 use crate::outline::{self, Budget};
 use crate::raw::{RawNode, RawVariable};
@@ -203,12 +208,24 @@ pub struct GenerateArgs {
 // Server
 // ---------------------------------------------------------------------------
 
+/// Lazily-started language server, shared across calls.
+///
+/// A TypeScript server can take tens of seconds to index a large project, so it
+/// is started once and reused. A failure is remembered too — retrying a server
+/// that is not installed on every call would just add latency to every call.
+enum Lsp {
+    Unchecked,
+    Unavailable(String),
+    Ready(Box<LspClient>),
+}
+
 #[derive(Clone)]
 pub struct FigmaServer {
     bridge: Bridge,
     out_dir: PathBuf,
     /// The project whose conventions generated code should follow.
     project_root: PathBuf,
+    lsp: Arc<AsyncMutex<Lsp>>,
 }
 
 #[tool_router]
@@ -218,7 +235,90 @@ impl FigmaServer {
             bridge,
             out_dir,
             project_root,
+            lsp: Arc::new(AsyncMutex::new(Lsp::Unchecked)),
         }
+    }
+
+    /// Confirm each component exists and resolve where it actually lives.
+    ///
+    /// Returns a human-readable note for the caller. Any failure here is
+    /// reported and stepped over: convention-derived imports are the fallback,
+    /// and a missing language server must never block generating code.
+    async fn verify_components(&self, detected: &mut Stack, wanted: &[String]) -> String {
+        if wanted.is_empty() {
+            return String::new();
+        }
+
+        let mut guard = self.lsp.lock().await;
+        if matches!(*guard, Lsp::Unchecked) {
+            *guard = match lsp::detect(&self.project_root, detected.framework) {
+                None => Lsp::Unavailable(
+                    "no language server found; import paths follow project convention".into(),
+                ),
+                Some(spec) => {
+                    let reason = spec.reason.clone();
+                    // Indexing dominates this; a short timeout would just fail.
+                    match LspClient::spawn(&spec, &self.project_root, Duration::from_secs(60)).await
+                    {
+                        Ok(c) => {
+                            tracing::info!("language server ready: {reason}");
+                            Lsp::Ready(Box::new(c))
+                        }
+                        Err(e) => Lsp::Unavailable(format!("{reason} failed to start: {e}")),
+                    }
+                }
+            };
+        }
+
+        let client = match &*guard {
+            Lsp::Ready(c) => c,
+            Lsp::Unavailable(why) => return format!("Imports not verified: {why}.\n"),
+            Lsp::Unchecked => unreachable!("just initialised"),
+        };
+
+        let mut verified = Vec::new();
+        let mut missing = Vec::new();
+        let mut moved = Vec::new();
+
+        for name in wanted {
+            match client.find_component(name).await {
+                Ok(Some(sym)) => {
+                    if let Some(spec) = detected.import_specifier(&self.project_root, &sym.path) {
+                        let conventional = detected.conventional_import_path(name);
+                        if spec != conventional {
+                            moved.push(format!("{name}: {conventional} -> {spec}"));
+                        }
+                        detected.verified_imports.insert(name.clone(), spec);
+                        verified.push(name.clone());
+                    }
+                }
+                Ok(None) => missing.push(name.clone()),
+                Err(e) => {
+                    return format!("Imports not verified: language server error: {e}.\n");
+                }
+            }
+        }
+
+        let mut note = String::new();
+        if !verified.is_empty() {
+            note.push_str(&format!(
+                "Verified against the codebase: {}.\n",
+                verified.join(", ")
+            ));
+        }
+        for m in &moved {
+            note.push_str(&format!("  corrected {m}\n"));
+        }
+        if !missing.is_empty() {
+            // This is the useful signal: the design references something the
+            // codebase does not have yet.
+            note.push_str(&format!(
+                "Not found in the codebase: {}. These imports are guesses \
+                 — the component may need building first.\n",
+                missing.join(", ")
+            ));
+        }
+        note
     }
 
     async fn nodes_param(&self, ids: Option<Vec<String>>) -> Value {
@@ -662,7 +762,14 @@ impl FigmaServer {
         let tokens = self.tokens().await.unwrap_or_default();
 
         // Match the project this code is going to land in, rather than guessing.
-        let detected = stack::detect(&self.project_root);
+        let mut detected = stack::detect(&self.project_root);
+        // Then let a language server correct that guess where it can.
+        let verification = self
+            .verify_components(
+                &mut detected,
+                &root.component_names().into_iter().collect::<Vec<_>>(),
+            )
+            .await;
         let generated = codegen::generate(
             root,
             &tokens,
@@ -688,7 +795,7 @@ impl FigmaServer {
         }
 
         out.push_str(&format!(
-            "{}\n{} from {} nodes.\n",
+            "{}\n{verification}{} from {} nodes.\n",
             generated.stack_summary, generated.component_name, generated.node_count
         ));
         if !generated.imported_components.is_empty() {

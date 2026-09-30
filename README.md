@@ -203,6 +203,44 @@ A detector that cannot say *why* it decided something is impossible to correct,
 and when nothing is found it says so rather than pretending: *"No project
 detected; emitting React + TypeScript + CSS modules by default."*
 
+### Then a language server checks that guess
+
+File-scanning tells you what a project's *conventions* are. It cannot tell you
+whether `Button` actually exists at `@/components/Button`, or whether the design
+is referencing a component nobody has built yet. A language server already knows
+— it has resolved the project's modules, aliases and types — so it is asked:
+
+```
+Detected: React · TypeScript · Tailwind · alias @/ · app router
+Verified against the codebase: Button, Badge.
+  corrected Badge: @/components/Badge -> @/design-system/Badge
+Not found in the codebase: PriceTag. These imports are guesses — the component
+may need building first.
+```
+
+That last line is the useful one. It is the difference between code that compiles
+and code that looks like it should.
+
+Servers are found in `node_modules/.bin` first — the version the project actually
+pins — then on `PATH`: `typescript-language-server`, `vtsls`,
+`vue-language-server`, `svelteserver`, `ngserver`, picked to match the detected
+framework.
+
+**It is enrichment, never a requirement.** If no server is installed, or it fails
+to start, or it hangs, generation proceeds on the file-scanned stack and says so.
+A tool that breaks when an optional dependency is missing is not optional. The
+server is started once and reused, because a TypeScript project can take tens of
+seconds to index, and a failure is remembered rather than retried on every call.
+
+Two details that matter for correctness:
+
+- **`workspace/symbol` is a fuzzy search.** Asking for `Button` returns
+  `ButtonGroup`, `IconButton` and `buttonStyles`. Only an exact name match of a
+  definition-like symbol kind is accepted; otherwise you get an import for a
+  component that does not exist under the name being written.
+- **A dependency's `Button` is not your `Button`.** A match inside
+  `node_modules` loses to one in your own source.
+
 ## Code that survives review
 
 Output is held to what a developer would have written by hand:
@@ -436,7 +474,7 @@ WebSockets — use Figma Desktop there, or terminate TLS locally.
 ## Development
 
 ```bash
-cargo test                                      # 76 tests
+cargo test                                      # 92 tests
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all --check
 node --check plugin/code.js                     # syntax only; not a dependency
@@ -446,9 +484,10 @@ Four layers of test, all run by CI on Linux, macOS and Windows:
 
 | Suite | What it covers |
 |---|---|
-| unit (51) | The layout mapping, codegen rules, and motion — including a test that fails if `getCSSAsync()` ever overrides the IR's layout, and one asserting an underdamped spring actually overshoots while an overdamped one does not |
+| unit (60) | The layout mapping, codegen rules, and motion — including a test that fails if `getCSSAsync()` ever overrides the IR's layout, and one asserting an underdamped spring actually overshoots while an overdamped one does not |
 | `tests/bridge_roundtrip.rs` (8) | The real WebSocket server driven by a fake plugin — wire protocol, IR, motion and codegen end to end, without Figma |
 | `tests/plugin_consistency.rs` (7) | Rust/plugin drift: port agreement across `main.rs`, `manifest.json` and `ui.html`; every op the server calls exists in the plugin and none are dead; no synchronous Figma APIs under `documentAccess: dynamic-page` |
+| `tests/lsp_protocol.rs` (7) | The real LSP client against a fake language server over an in-memory pipe — framing, handshake, request correlation, fuzzy-match rejection, `node_modules` deprioritisation, and that a hung server times out instead of blocking generation |
 | `tests/mcp_stdio.rs` (3) | A real `initialize` / `tools/list` / `tools/call` handshake against the compiled binary, asserting stdout is clean JSON-RPC |
 | `tests/token_budget.rs` (7) | Enforced token budgets on a realistic 151-node screen, that cost grows sub-linearly with design size, that the fidelity levels are genuinely priced apart, and the per-request schema floor |
 

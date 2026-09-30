@@ -57,6 +57,12 @@ pub struct Stack {
     pub semicolons: bool,
     /// Next.js app router needs "use client" on anything interactive.
     pub react_server_components: bool,
+    /// Component name -> import specifier, confirmed by a language server.
+    ///
+    /// These beat the convention-derived path, because they are the file that
+    /// actually defines the component rather than where convention says it
+    /// should live.
+    pub verified_imports: BTreeMap<String, String>,
     /// Why each conclusion was reached, so a wrong guess is correctable.
     pub evidence: Vec<String>,
     /// True when nothing was found and these are defaults, not detections.
@@ -74,6 +80,7 @@ impl Default for Stack {
             single_quotes: false,
             semicolons: true,
             react_server_components: false,
+            verified_imports: BTreeMap::new(),
             evidence: Vec::new(),
             guessed: true,
         }
@@ -112,8 +119,19 @@ impl Stack {
         format!("Detected: {}", parts.join(" · "))
     }
 
-    /// The import path for a component, following the project's own conventions.
+    /// The import path for a component.
+    ///
+    /// A language-server-verified path wins: convention says where a component
+    /// *should* live, but the server knows where it *does*.
     pub fn import_path(&self, component: &str) -> String {
+        if let Some(verified) = self.verified_imports.get(component) {
+            return verified.clone();
+        }
+        self.conventional_import_path(component)
+    }
+
+    /// Where convention says a component lives, ignoring any verification.
+    pub fn conventional_import_path(&self, component: &str) -> String {
         let dir = self.component_dir.as_deref().unwrap_or("components");
         match &self.alias {
             // `@/` maps to a source root, so strip that prefix from the path.
@@ -125,6 +143,41 @@ impl Stack {
                 format!("{prefix}{rel}/{component}")
             }
             None => format!("./{}/{component}", dir.trim_start_matches("./")),
+        }
+    }
+
+    /// Turn an absolute file path into an import specifier this project would
+    /// actually write.
+    ///
+    /// `/app/src/components/Button.tsx` with alias `@/ -> src/` and root `/app`
+    /// becomes `@/components/Button`.
+    pub fn import_specifier(&self, root: &Path, file: &Path) -> Option<String> {
+        let rel = file.strip_prefix(root).ok()?;
+        let mut rel = rel.to_string_lossy().replace('\\', "/");
+
+        // Drop the extension, and collapse a directory's index file.
+        for ext in [
+            ".tsx", ".ts", ".jsx", ".js", ".vue", ".svelte", ".mjs", ".d.ts",
+        ] {
+            if let Some(stripped) = rel.strip_suffix(ext) {
+                rel = stripped.to_string();
+                break;
+            }
+        }
+        if let Some(stripped) = rel.strip_suffix("/index") {
+            rel = stripped.to_string();
+        }
+
+        match &self.alias {
+            Some((prefix, target)) => {
+                let t = target.trim_end_matches('/');
+                match rel.strip_prefix(t).and_then(|r| r.strip_prefix('/')) {
+                    Some(inner) => Some(format!("{prefix}{inner}")),
+                    // Outside the aliased root, so a relative path is honest.
+                    None => Some(format!("./{rel}")),
+                }
+            }
+            None => Some(format!("./{rel}")),
         }
     }
 
@@ -528,5 +581,65 @@ mod tests {
         let s = detect(&dir);
         assert!(s.single_quotes);
         assert!(!s.semicolons);
+    }
+}
+
+#[cfg(test)]
+mod specifier_tests {
+    use super::*;
+
+    fn aliased() -> Stack {
+        Stack {
+            alias: Some(("@/".into(), "src/".into())),
+            component_dir: Some("src/components".into()),
+            guessed: false,
+            ..Stack::default()
+        }
+    }
+
+    #[test]
+    fn a_resolved_file_becomes_an_aliased_specifier() {
+        let s = aliased();
+        assert_eq!(
+            s.import_specifier(
+                Path::new("/app"),
+                Path::new("/app/src/components/Button.tsx")
+            )
+            .as_deref(),
+            Some("@/components/Button")
+        );
+    }
+
+    #[test]
+    fn an_index_file_collapses_to_its_directory() {
+        let s = aliased();
+        assert_eq!(
+            s.import_specifier(Path::new("/app"), Path::new("/app/src/ui/Card/index.tsx"))
+                .as_deref(),
+            Some("@/ui/Card")
+        );
+    }
+
+    #[test]
+    fn a_file_outside_the_alias_root_stays_relative() {
+        let s = aliased();
+        assert_eq!(
+            s.import_specifier(Path::new("/app"), Path::new("/app/packages/ui/Chip.tsx"))
+                .as_deref(),
+            Some("./packages/ui/Chip")
+        );
+    }
+
+    #[test]
+    fn a_verified_import_overrides_convention() {
+        let mut s = aliased();
+        assert_eq!(s.import_path("Button"), "@/components/Button");
+
+        // The server found it somewhere convention did not predict.
+        s.verified_imports
+            .insert("Button".into(), "@/design-system/controls/Button".into());
+        assert_eq!(s.import_path("Button"), "@/design-system/controls/Button");
+        // Convention is still available for reporting the difference.
+        assert_eq!(s.conventional_import_path("Button"), "@/components/Button");
     }
 }

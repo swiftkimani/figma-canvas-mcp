@@ -1399,6 +1399,7 @@ mod tests {
             single_quotes: true,
             semicolons: false,
             react_server_components: true,
+            verified_imports: Default::default(),
             evidence: vec![],
             guessed: false,
         };

@@ -497,6 +497,18 @@ impl FigmaServer {
         // configured to launch this binary, and it looks nothing like a plugin
         // problem — so it must not be reported as one.
         if let Some(reason) = &s.startup_error {
+            // REST is unaffected by a port clash, so if it is configured the
+            // answer is "use it", not a page about ports.
+            if RestClient::from_env().is_some() {
+                return Ok(format!(
+                    "The bridge could not start ({reason}), because another MCP client already \
+                     holds the port.\n\n                     This does not block you: FIGMA_TOKEN is set, so pass a Figma URL to `auto` \
+                     or `read_scene` and they will read it over REST. That path needs no bridge, \
+                     no plugin and no Desktop app.\n\n                     Only reading the live *selection* needs the bridge, and for that you would \
+                     use whichever client currently owns the port."
+                ));
+            }
+
             let lines = [
                 "The bridge never started, so the plugin cannot reach this server.",
                 "",
@@ -511,6 +523,9 @@ impl FigmaServer {
                 "manifest.json changed to match.",
                 "",
                 "`figma-canvas-mcp doctor` confirms which it is.",
+                "",
+                "Or sidestep it entirely: set FIGMA_TOKEN and pass a Figma URL to `auto`. REST",
+                "needs no bridge, so a port clash cannot block it, and it needs only view access.",
             ];
             return Ok(lines.join("\n"));
         }

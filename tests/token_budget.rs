@@ -296,9 +296,11 @@ fn the_per_request_schema_floor_stays_small() {
     let _ = child.wait();
 
     let floor = tokens(instructions + schema);
+    // Two more tools were added deliberately: `auto` exists to collapse a
+    // four-call sequence into one, which saves far more than its schema costs.
     assert!(
-        floor < 2_500,
-        "every request pays ~{floor} tokens for instructions plus tool schemas; budget is 2500"
+        floor < 3_000,
+        "every request pays ~{floor} tokens for instructions plus tool schemas; budget is 3000"
     );
 }
 

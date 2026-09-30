@@ -146,6 +146,42 @@ so a Figma reload or a browser refresh needs no restart.
 **Check it worked:** ask your client to call `figma_status`. `"connected": true`
 and a green dot in the panel means you are done.
 
+### Just do everything
+
+`auto` collapses the whole sequence into one call, because chaining four tools by
+hand is tedious and costs more tokens than doing it in one:
+
+```
+auto url="https://figma.com/design/<key>/<name>?node-id=4442-2123"
+```
+
+It reads the design, assesses it, detects your project's stack, verifies the
+components against your codebase, generates the code, exports the vectors it
+references, and writes the files — then returns a short summary rather than a
+transcript:
+
+```
+Read https://figma.com/design/... over REST.
+  hist-grid (42 nodes, depth 5)
+  18 design token(s)
+
+Detected: React · TypeScript · Tailwind · alias @/ · app router
+Verified against the codebase: Button, Badge.
+
+Generated HistGrid from 42 nodes.
+
+Wrote:
+  figma-out/HistGrid.tsx
+  figma-out/HistGrid.module.css
+  figma-out/tokens.css
+
+Design health:
+  ! 89% of layers still have default names...
+```
+
+With no `url` it reads the live selection through the plugin instead. `write=false`
+returns the files without touching disk.
+
 ### Your first useful call
 
 Select a frame in Figma, then:
@@ -203,6 +239,8 @@ enough to identify it.
 | `export_assets` | SVG / PNG / JPG / PDF at any scale, written to disk |
 | `get_interactions` | Prototype triggers, actions, and motion — durations, easing, and the screen flow |
 | `generate_code` | React + TypeScript, with CSS modules, Tailwind, or inline styles |
+| **`auto`** | **All of the above in one call** — read, assess, detect stack, verify, generate, export, write |
+| `open_design` | Open a Figma URL in your default browser, alongside the read |
 
 ## Install, in more detail
 

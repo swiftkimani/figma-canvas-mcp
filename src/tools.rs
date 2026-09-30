@@ -184,6 +184,36 @@ pub struct ReadSceneArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct AutoArgs {
+    /// A Figma URL to read. Needs FIGMA_TOKEN and only view access.
+    /// Omit to use the live selection through the plugin instead.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// Figma node ids. Omit to use the URL's node-id, or the selection.
+    #[serde(default)]
+    pub node_ids: Option<Vec<String>>,
+    /// Override the component name. Defaults to the frame's name.
+    #[serde(default)]
+    pub component_name: Option<String>,
+    /// Force a styling approach. Omit to follow the project's own convention.
+    #[serde(default)]
+    pub style_mode: Option<StyleMode>,
+    /// Write the files to --out-dir. Default true; this tool exists to finish
+    /// the job rather than hand back a transcript.
+    #[serde(default)]
+    pub write: Option<bool>,
+    /// Also export any vector nodes the code references. Default true.
+    #[serde(default)]
+    pub export_assets: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct OpenArgs {
+    /// The Figma URL to open in your default browser.
+    pub url: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct TokensArgs {
     /// Above this many tokens the JSON listing is summarised by collection, with
     /// the full values left to tokens.css. Default 80.
@@ -898,6 +928,190 @@ impl FigmaServer {
         }
         out.push_str(&format!("\n{}", pretty(&json!({ "nodes": nodes }))?));
         Ok(out)
+    }
+
+    /// Everything, in one call.
+    #[tool(
+        description = "Do the whole job in one call: read the design, assess it, detect the \
+                       target project's stack, verify components against the codebase, generate \
+                       the code, export any vectors it references, and write the files to disk. \
+                       Returns a short summary rather than a transcript. Use this instead of \
+                       chaining read_scene, get_tokens, generate_code and export_assets by hand."
+    )]
+    async fn auto(&self, Parameters(args): Parameters<AutoArgs>) -> Result<String, ErrorData> {
+        let write = args.write.unwrap_or(true);
+        let mut log = String::new();
+
+        // 1. Read, from whichever source is actually available.
+        let nodes = match &args.url {
+            Some(url) => {
+                log.push_str(&format!("Read {url} over REST.\n"));
+                self.scene_over_rest(url, args.node_ids.clone(), 24).await?
+            }
+            None => {
+                log.push_str("Read the live selection through the plugin.\n");
+                self.scene(args.node_ids.clone(), 24, true).await?
+            }
+        };
+        let Some(root) = nodes.first() else {
+            return Ok("Nothing to read. Pass a url, or select a frame in Figma.".into());
+        };
+        log.push_str(&format!(
+            "  {} ({} nodes, depth {})\n",
+            root.name,
+            root.count(),
+            root.depth()
+        ));
+
+        // 2. Tokens are best-effort; a file without variables still generates.
+        let tokens = self.tokens().await.unwrap_or_default();
+        if !tokens.is_empty() {
+            log.push_str(&format!("  {} design token(s)\n", tokens.len()));
+        }
+
+        // 3. Match the target project, and confirm its components really exist.
+        let mut detected = stack::detect(&self.project_root);
+        let verification = self
+            .verify_components(
+                &mut detected,
+                &root.component_names().into_iter().collect::<Vec<_>>(),
+            )
+            .await;
+
+        // 4. Generate.
+        let generated = codegen::generate(
+            root,
+            &tokens,
+            &detected,
+            args.style_mode,
+            args.component_name.as_deref(),
+        );
+
+        // 5. Write, because the point of this tool is to finish.
+        let mut written = Vec::new();
+        if write {
+            tokio::fs::create_dir_all(&self.out_dir)
+                .await
+                .map_err(|e| bad(format!("could not create {}: {e}", self.out_dir.display())))?;
+            for f in &generated.files {
+                let path = self.out_dir.join(&f.path);
+                tokio::fs::write(&path, &f.contents)
+                    .await
+                    .map_err(|e| bad(format!("could not write {}: {e}", path.display())))?;
+                written.push(path.display().to_string());
+            }
+        }
+
+        // 6. Vectors, so the result actually renders. Only over the plugin —
+        //    REST cannot export, and saying so beats failing quietly.
+        let mut assets = String::new();
+        if args.export_assets.unwrap_or(true) && !generated.pending_assets.is_empty() {
+            if args.url.is_some() {
+                assets = format!(
+                    "\n{} vector(s) still need exporting; REST cannot do it. Run export_assets \
+                     with the plugin connected, or export them from Figma by hand.\n",
+                    generated.pending_assets.len()
+                );
+            } else {
+                match self
+                    .export_assets(Parameters(ExportArgs {
+                        node_ids: Some(generated.pending_assets.clone()),
+                        format: Some("SVG".into()),
+                        scale: None,
+                        out_dir: None,
+                    }))
+                    .await
+                {
+                    Ok(_) => {
+                        assets = format!(
+                            "\nExported {} vector(s) to {}/assets.\n",
+                            generated.pending_assets.len(),
+                            self.out_dir.display()
+                        );
+                    }
+                    Err(e) => assets = format!("\nVector export failed: {e}\n"),
+                }
+            }
+        }
+
+        // 7. One compact report, not a transcript.
+        let mut out = format!(
+            "{log}\n{}\n{verification}Generated {} from {} nodes.\n",
+            detected.summary(),
+            generated.component_name,
+            generated.node_count
+        );
+        if !written.is_empty() {
+            out.push_str("\nWrote:\n");
+            for w in &written {
+                out.push_str(&format!("  {w}\n"));
+            }
+        } else {
+            out.push_str("\nNot written (write=false). Files:\n");
+            for f in &generated.files {
+                out.push_str(&format!("  {} ({} bytes)\n", f.path, f.contents.len()));
+            }
+        }
+        out.push_str(&assets);
+
+        if !generated.imported_components.is_empty() {
+            out.push_str(&format!(
+                "\nReferences: {}\n",
+                generated.imported_components.join(", ")
+            ));
+        }
+        for w in &generated.warnings {
+            out.push_str(&format!("warning: {w}\n"));
+        }
+
+        // The design's own problems are what limit the output, so they lead.
+        let report = health::assess(std::slice::from_ref(root)).report();
+        if !report.is_empty() {
+            out.push_str(&format!("\n{report}"));
+        }
+        Ok(out)
+    }
+
+    /// Open the file where the user can actually see it.
+    #[tool(
+        description = "Open a Figma URL in the user's default browser. Useful alongside a read, \
+                       so the design and the generated code can be compared. Opens the browser \
+                       the person is already signed into; it does not read the file."
+    )]
+    async fn open_design(
+        &self,
+        Parameters(args): Parameters<OpenArgs>,
+    ) -> Result<String, ErrorData> {
+        if !args.url.contains("figma.com") {
+            return Err(bad("open_design only opens figma.com links"));
+        }
+
+        // Whatever this platform uses to hand a URL to the default browser.
+        let (cmd, pre): (&str, &[&str]) = if cfg!(target_os = "macos") {
+            ("open", &[])
+        } else if cfg!(target_os = "windows") {
+            ("cmd", &["/C", "start", ""])
+        } else {
+            ("xdg-open", &[])
+        };
+
+        let status = tokio::process::Command::new(cmd)
+            .args(pre)
+            .arg(&args.url)
+            .status()
+            .await
+            .map_err(|e| bad(format!("could not launch {cmd}: {e}")))?;
+
+        if !status.success() {
+            return Err(bad(format!("{cmd} exited with {status}")));
+        }
+        Ok(format!(
+            "Opened {} in your default browser.\n\nIt opens in the browser you are already \
+             signed into, so no login is needed. Figma has no plugin development mode in the \
+             browser, so to read it from here either pass the same URL to auto or read_scene \
+             (needs FIGMA_TOKEN), or connect the plugin from the Desktop app.",
+            args.url
+        ))
     }
 
     /// The payoff: canvas to React.

@@ -103,13 +103,15 @@ fn every_tool_is_listed_with_a_description_and_schema() {
         "export_assets",
         "generate_code",
         "get_interactions",
+        "auto",
+        "open_design",
     ] {
         assert!(
             names.contains(&expected),
             "tool {expected} is missing from {names:?}"
         );
     }
-    assert_eq!(names.len(), 9, "unexpected tool count: {names:?}");
+    assert_eq!(names.len(), 11, "unexpected tool count: {names:?}");
 
     for t in &tools {
         let name = t["name"].as_str().unwrap();
@@ -187,8 +189,21 @@ fn a_port_clash_is_reported_as_a_port_clash_not_a_missing_plugin() {
         .spawn()
         .expect("spawn the holder");
 
-    // Give it a moment to bind before the second one tries.
-    std::thread::sleep(std::time::Duration::from_millis(600));
+    // Wait until the port is genuinely held rather than guessing at a delay.
+    // A fixed sleep passes on an idle machine and fails on a busy one, which is
+    // the worst kind of test.
+    let mut bound = false;
+    for _ in 0..100 {
+        if std::net::TcpStream::connect(("127.0.0.1", PORT.parse::<u16>().unwrap())).is_ok() {
+            bound = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    if !bound {
+        let _ = holder.kill();
+        panic!("the holder never bound port {PORT}; cannot test a clash that did not happen");
+    }
 
     let mut loser = Command::new(env!("CARGO_BIN_EXE_figma-canvas-mcp"))
         .args(["--port", PORT])

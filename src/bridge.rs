@@ -63,6 +63,13 @@ struct Inner {
     session: Mutex<Option<Session>>,
     pending: Mutex<HashMap<String, oneshot::Sender<BridgeResponse>>>,
     timeout: Duration,
+    /// Why the listener never opened, if it did not.
+    ///
+    /// Only one process can hold the bridge port, and it is normal for several
+    /// MCP clients to be configured to launch this binary. Without this, the
+    /// loser reports "no plugin connected" — which sends the user to look at
+    /// Figma when the problem is entirely on this side.
+    startup_error: Mutex<Option<String>>,
 }
 
 #[derive(Clone)]
@@ -76,6 +83,8 @@ pub struct BridgeStatus {
     pub connected: bool,
     pub hello: Option<Hello>,
     pub selection: Vec<String>,
+    /// Set when the bridge listener could not be opened at all.
+    pub startup_error: Option<String>,
 }
 
 impl Bridge {
@@ -85,22 +94,31 @@ impl Bridge {
                 session: Mutex::new(None),
                 pending: Mutex::new(HashMap::new()),
                 timeout,
+                startup_error: Mutex::new(None),
             }),
         }
     }
 
+    /// Record that the listener could not be opened, so tools can say why.
+    pub async fn record_startup_error(&self, reason: impl Into<String>) {
+        *self.inner.startup_error.lock().await = Some(reason.into());
+    }
+
     pub async fn status(&self) -> BridgeStatus {
+        let startup_error = self.inner.startup_error.lock().await.clone();
         let guard = self.inner.session.lock().await;
         match guard.as_ref() {
             Some(s) => BridgeStatus {
                 connected: true,
                 hello: s.hello.clone(),
                 selection: s.selection.clone(),
+                startup_error,
             },
             None => BridgeStatus {
                 connected: false,
                 hello: None,
                 selection: Vec::new(),
+                startup_error,
             },
         }
     }

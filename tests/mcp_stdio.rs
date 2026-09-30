@@ -167,3 +167,101 @@ fn calling_a_tool_without_the_plugin_explains_what_to_do() {
         "read_scene should explain the missing plugin: {text}"
     );
 }
+
+/// Spawn a server that holds a port, keeping its stdin open so it does not exit
+/// on EOF, then ask a second server on the same port what is wrong.
+///
+/// This is the situation created by configuring several MCP clients to launch the
+/// same binary, which is normal — Claude Code, Antigravity and Codex can all be
+/// pointed at it. Only one can hold the bridge port, and the loser must not
+/// report it as a Figma problem.
+#[test]
+fn a_port_clash_is_reported_as_a_port_clash_not_a_missing_plugin() {
+    const PORT: &str = "18774";
+
+    let mut holder = Command::new(env!("CARGO_BIN_EXE_figma-canvas-mcp"))
+        .args(["--port", PORT])
+        .stdin(Stdio::piped()) // held open, so it keeps running
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn the holder");
+
+    // Give it a moment to bind before the second one tries.
+    std::thread::sleep(std::time::Duration::from_millis(600));
+
+    let mut loser = Command::new(env!("CARGO_BIN_EXE_figma-canvas-mcp"))
+        .args(["--port", PORT])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn the loser");
+
+    {
+        let stdin = loser.stdin.as_mut().unwrap();
+        writeln!(stdin, "{}", init()).unwrap();
+        writeln!(
+            stdin,
+            r#"{{"jsonrpc":"2.0","method":"notifications/initialized"}}"#
+        )
+        .unwrap();
+        writeln!(
+            stdin,
+            r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"figma_status","arguments":{{}}}}}}"#
+        )
+        .unwrap();
+        writeln!(
+            stdin,
+            r#"{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{"name":"read_scene","arguments":{{}}}}}}"#
+        )
+        .unwrap();
+    }
+    drop(loser.stdin.take());
+
+    let mut status = String::new();
+    let mut scene = String::new();
+    for line in BufReader::new(loser.stdout.take().unwrap()).lines() {
+        let line = line.unwrap();
+        if line.trim().is_empty() {
+            continue;
+        }
+        let m: serde_json::Value = serde_json::from_str(&line).unwrap();
+        if m["id"] == 2 {
+            status = m["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap_or("")
+                .to_string();
+        }
+        if m["id"] == 3 {
+            scene = serde_json::to_string(&m).unwrap();
+        }
+    }
+    let _ = loser.wait();
+    let _ = holder.kill();
+    let _ = holder.wait();
+
+    // figma_status must name the real cause and the real port.
+    assert!(
+        status.contains("bridge never started"),
+        "should say the bridge failed, not that Figma is absent:\n{status}"
+    );
+    assert!(
+        status.contains(PORT),
+        "the actual port must appear, not a hardcoded default:\n{status}"
+    );
+    assert!(
+        status.contains("another client already has it running"),
+        "the likeliest cause should be named:\n{status}"
+    );
+    assert!(
+        !status.contains("leave the plugin panel open"),
+        "must not send the user to Figma for a problem on this side:\n{status}"
+    );
+
+    // And a real tool call must fail with the same cause, not a generic timeout.
+    assert!(
+        scene.contains("bridge never started"),
+        "read_scene should fail with the real reason:\n{scene}"
+    );
+}

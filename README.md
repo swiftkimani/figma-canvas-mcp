@@ -101,7 +101,7 @@ Roughly in the order these actually happen:
 | `figma_status` says "Not connected" | the plugin panel is closed | Open your file and run **Plugins → Development → Figma Canvas Bridge**. The panel must stay open. |
 | plugin panel shows "Reconnecting…" forever | the server is not running, or is on another port | Your MCP client starts the server — check it is configured and enabled. Then `doctor` to confirm the port. |
 | plugin will not connect in Safari or Firefox | those browsers block loopback WebSockets | Use the Figma **Desktop** app, or Chrome/Edge, which treat `ws://127.0.0.1` as trustworthy. |
-| `cannot bind 127.0.0.1:18765` | another copy is already running | Stop it, or use `--port`, and change `var PORT` in `plugin/ui.html` and `allowedDomains` in `plugin/manifest.json` to match. `doctor` verifies all three agree. |
+| `figma_status` says "The bridge never started" | another MCP client already holds the port | Expected if you have several clients configured. Use one at a time, or give this one `--port <other>` plus a copy of the plugin with `var PORT` and `allowedDomains` changed to match. `doctor` verifies all three agree. |
 | "nests deeper than 40 levels" | the selection is very deeply nested | Select a nested frame and read it by `node_id` instead. |
 | imports point at components that do not exist | no language server, so paths follow convention only | Install `typescript-language-server`. Optional — but then paths are verified rather than inferred. |
 | output is full of `position: absolute` | the design does not use auto layout | Not a tool problem. `read_scene` reports this and says what to change; see [Organised files and real ones](#organised-files-and-real-ones). |
@@ -668,6 +668,43 @@ WebSockets — use Figma Desktop there, or terminate TLS locally.
 - Per-range text spans.
 - Full grid track reconstruction.
 - Vue and Svelte emitters — the IR is framework-agnostic; only `codegen` is not.
+
+## Using it from more than one client
+
+Nothing here is Claude-specific — it is MCP over stdio, so any client works. All
+of these read a different config file, and registering it in several is fine:
+
+| client | config |
+|---|---|
+| Claude Code (CLI **and** the IDE extension) | `claude mcp add figma-canvas --scope user -- ~/.cargo/bin/figma-canvas-mcp` |
+| Google Antigravity | `~/.gemini/config/mcp_config.json`, under `mcpServers` |
+| Codex | `codex mcp add`, or `[mcp_servers.figma-canvas]` in `~/.codex/config.toml` |
+| Cursor / Windsurf / Zed / Cline / Continue | that client's `mcpServers` block |
+
+**But only one can run at a time.** Each client launches its own copy of the
+binary, and every copy tries to bind the same bridge port — the plugin dials a
+fixed port, so it cannot be negotiated. The second copy to start loses.
+
+That case is diagnosed explicitly rather than looking like a Figma problem:
+
+```
+The bridge never started, so the plugin cannot reach this server.
+
+  could not bind 127.0.0.1:18765 (is another instance running?): Address already in use
+
+Almost always this means another client already has it running. Claude Code,
+Antigravity and Codex can each be configured to launch this binary, and only
+one process can hold the bridge port.
+```
+
+To run two clients at once, give one a different port and a matching copy of the
+plugin:
+
+```bash
+cp -r ~/.figma-canvas-mcp/plugin ~/.figma-canvas-mcp/plugin-18766
+# then in plugin-18766: change `var PORT` in ui.html and allowedDomains in
+# manifest.json to 18766, and import that manifest as a second Figma plugin
+```
 
 ## Reference
 

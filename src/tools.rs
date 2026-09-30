@@ -349,12 +349,23 @@ impl FigmaServer {
     }
 
     /// Fetch the raw tree and normalize it.
+    /// Fail early with the real reason when the bridge itself never opened.
+    async fn require_bridge(&self) -> Result<(), ErrorData> {
+        if let Some(reason) = self.bridge.status().await.startup_error {
+            return Err(bad(format!(
+                "The bridge never started: {reason}. Another MCP client is probably already                  running this server and holding the port. Call figma_status for the full                  explanation."
+            )));
+        }
+        Ok(())
+    }
+
     async fn scene(
         &self,
         ids: Option<Vec<String>>,
         depth: u32,
         include_css: bool,
     ) -> Result<Vec<ir::Node>, ErrorData> {
+        self.require_bridge().await?;
         let mut params = self.nodes_param(ids).await;
         params["depth"] = json!(depth);
         params["includeCss"] = json!(include_css);
@@ -377,6 +388,7 @@ impl FigmaServer {
     }
 
     async fn tokens(&self) -> Result<Vec<Token>, ErrorData> {
+        self.require_bridge().await?;
         let raw = self.bridge.call("variables", json!({})).await?;
         let vars: Vec<RawVariable> = serde_json::from_value(raw)
             .map_err(|e| bad(format!("plugin sent variables we could not decode: {e}")))?;
@@ -394,6 +406,29 @@ impl FigmaServer {
     )]
     async fn figma_status(&self) -> Result<String, ErrorData> {
         let s = self.bridge.status().await;
+
+        // A port clash is the likeliest cause once more than one MCP client is
+        // configured to launch this binary, and it looks nothing like a plugin
+        // problem — so it must not be reported as one.
+        if let Some(reason) = &s.startup_error {
+            let lines = [
+                "The bridge never started, so the plugin cannot reach this server.",
+                "",
+                &format!("  {reason}"),
+                "",
+                "Almost always this means another client already has it running. Claude Code,",
+                "Antigravity and Codex can each be configured to launch this binary, and only",
+                "one process can hold the bridge port.",
+                "",
+                "Either use one client at a time, or give this one --port <other> plus a copy",
+                "of the plugin with `var PORT` in ui.html and `allowedDomains` in",
+                "manifest.json changed to match.",
+                "",
+                "`figma-canvas-mcp doctor` confirms which it is.",
+            ];
+            return Ok(lines.join("\n"));
+        }
+
         if !s.connected {
             return Ok(concat!(
                 "Not connected.\n\n",

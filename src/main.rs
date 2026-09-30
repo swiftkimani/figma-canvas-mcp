@@ -134,17 +134,25 @@ async fn main() -> anyhow::Result<()> {
 
     let bridge = bridge::Bridge::new(args.timeout);
 
-    // The bridge outlives any single plugin connection, so a Figma reload or a
-    // browser refresh reattaches without restarting the server.
-    {
-        let bridge = bridge.clone();
-        let host = args.host.clone();
-        let port = args.port;
-        tokio::spawn(async move {
-            if let Err(e) = bridge.serve(&host, port).await {
-                tracing::error!("bridge stopped: {e:#}");
-            }
-        });
+    // Bind before serving, so a port clash is a fact the tools can report rather
+    // than a log line nobody sees. Several MCP clients being configured to launch
+    // this binary is normal, and only one of them can hold the port.
+    match bridge::Bridge::bind(&args.host, args.port).await {
+        Ok((listener, addr)) => {
+            tracing::info!("bridge listening on ws://{addr}");
+            let bridge = bridge.clone();
+            tokio::spawn(async move {
+                if let Err(e) = bridge.serve_on(listener).await {
+                    tracing::error!("bridge stopped: {e:#}");
+                }
+            });
+        }
+        Err(e) => {
+            // Not fatal: the MCP server still answers, and figma_status explains.
+            let reason = format!("{e:#}");
+            tracing::error!("bridge could not start: {reason}");
+            bridge.record_startup_error(reason).await;
+        }
     }
 
     tracing::info!(

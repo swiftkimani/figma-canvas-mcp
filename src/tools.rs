@@ -20,6 +20,47 @@ use crate::motion::{self, Action, Interaction};
 use crate::outline::{self, Budget};
 use crate::raw::{RawNode, RawVariable};
 
+/// What this response cost, and what the other levels would have.
+///
+/// The numbers are measured, not guessed: the scene is already in hand, so the
+/// other renderings can be produced and counted. Only `precise` and
+/// `exhaustive` carry an estimate, because Figma's per-node CSS was not fetched
+/// and is roughly twice the size of the model it annotates.
+fn price_list(nodes: &[ir::Node], used: Fidelity, actual_bytes: usize) -> String {
+    let tok = |b: usize| b / 4;
+
+    let sketch = outline::render(nodes, &Fidelity::Sketch.budget(None, None)).len();
+    let standard = outline::render(nodes, &Fidelity::Standard.budget(None, None)).len();
+    let full = serde_json::to_string(nodes).map(|s| s.len()).unwrap_or(0);
+
+    let mark = |f: Fidelity, n: usize, approx: bool| -> String {
+        let here = if f == used { " ← this" } else { "" };
+        format!(
+            "{}{} {}{}",
+            if approx { "≈" } else { "" },
+            tok(n),
+            match f {
+                Fidelity::Sketch => "sketch",
+                Fidelity::Standard => "standard",
+                Fidelity::Precise => "precise",
+                Fidelity::Exhaustive => "exhaustive",
+            },
+            here
+        )
+    };
+
+    let total: usize = nodes.iter().map(|n| n.count()).sum();
+    format!(
+        "\n[{total} nodes · ~{} tokens spent · fidelity: {} · {} · {} · {}]",
+        tok(actual_bytes),
+        mark(Fidelity::Sketch, sketch, false),
+        mark(Fidelity::Standard, standard, false),
+        // Precise adds Figma's CSS, which was not fetched here.
+        mark(Fidelity::Precise, full * 3, true),
+        mark(Fidelity::Exhaustive, full * 3, true),
+    )
+}
+
 fn bad(msg: impl Into<String>) -> ErrorData {
     ErrorData::internal_error(msg.into(), None)
 }
@@ -44,15 +85,46 @@ const PRETTY_LIMIT: usize = 2048;
 // Tool parameters
 // ---------------------------------------------------------------------------
 
+/// How much detail to buy.
+///
+/// Each step costs materially more than the last, so the level is explicit and
+/// every response prints what it spent and what the alternatives would have
+/// cost. Nobody should discover the price after paying it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "kebab-case")]
-pub enum Detail {
-    /// One line per node: ids, nesting, layout, sizing, components, text.
-    /// A small fraction of `full`'s size, and enough to decide what to inspect.
+pub enum Fidelity {
+    /// Shallow outline: the top few levels only. Answers "what is on this page".
+    Sketch,
+    /// Full-depth outline, repeated structures collapsed. The default, and
+    /// enough to generate code from.
     #[default]
-    Outline,
-    /// The complete scene model as JSON. Use on a subtree, not a whole page.
-    Full,
+    Standard,
+    /// The complete scene model as JSON, plus Figma's own CSS per node. Exact
+    /// values for one subtree — not for a whole page.
+    Precise,
+    /// Everything `precise` has, with no depth or node limit at all.
+    Exhaustive,
+}
+
+impl Fidelity {
+    fn is_full(self) -> bool {
+        matches!(self, Fidelity::Precise | Fidelity::Exhaustive)
+    }
+
+    fn budget(self, depth: Option<u32>, max_nodes: Option<u32>) -> Budget {
+        let (d, n) = match self {
+            Fidelity::Sketch => (3, 60),
+            Fidelity::Standard => (12, 300),
+            Fidelity::Precise => (12, 1_000),
+            Fidelity::Exhaustive => (u32::MAX, u32::MAX),
+        };
+        Budget {
+            max_depth: depth.unwrap_or(d) as usize,
+            max_nodes: max_nodes.unwrap_or(n) as usize,
+            // A sketch is the skeleton: structure without the words in it.
+            show_content: self != Fidelity::Sketch,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -60,9 +132,10 @@ pub struct ReadSceneArgs {
     /// Figma node ids to read. Omit to use the current selection in Figma.
     #[serde(default)]
     pub node_ids: Option<Vec<String>>,
-    /// "outline" (default, cheap) or "full" (complete JSON, expensive).
+    /// How much detail to buy: "sketch", "standard" (default), "precise" or
+    /// "exhaustive". Each response states what it cost and what the others would.
     #[serde(default)]
-    pub detail: Option<Detail>,
+    pub fidelity: Option<Fidelity>,
     /// Levels to show. Default 12.
     #[serde(default)]
     pub depth: Option<u32>,
@@ -221,47 +294,43 @@ impl FigmaServer {
     /// The reconstruction: a normalized, code-ready model of the canvas.
     #[tool(
         description = "Read the canvas: nesting, auto-layout as flexbox semantics, sizing, \
-                       token-named paint, text, and component/variant identity. Defaults to a \
-                       cheap one-line-per-node outline; pass detail=\"full\" with node_ids for \
-                       the complete model of one subtree. Use this instead of a screenshot."
+                       token-named paint, text, and component/variant identity. fidelity is \
+                       sketch | standard (default) | precise | exhaustive, each costing more \
+                       than the last; every response reports what it spent and what the other \
+                       levels would cost. Use this instead of a screenshot."
     )]
     async fn read_scene(
         &self,
         Parameters(args): Parameters<ReadSceneArgs>,
     ) -> Result<String, ErrorData> {
-        let detail = args.detail.unwrap_or_default();
-        let depth = args.depth.unwrap_or(12);
-        // getCSSAsync roughly triples the payload and the outline never shows
-        // per-node CSS, so it is ignored there rather than silently paid for.
-        let include_css = args.include_css.unwrap_or(false) && detail == Detail::Full;
+        let fidelity = args.fidelity.unwrap_or_default();
+        let budget = fidelity.budget(args.depth, args.max_nodes);
 
-        let nodes = self.scene(args.node_ids, depth, include_css).await?;
+        // getCSSAsync roughly triples the payload, and an outline never shows
+        // per-node CSS, so it is only fetched where it is actually rendered.
+        let include_css = args.include_css.unwrap_or(fidelity.is_full()) && fidelity.is_full();
+
+        let nodes = self
+            .scene(
+                args.node_ids,
+                budget.max_depth.min(u32::MAX as usize) as u32,
+                include_css,
+            )
+            .await?;
         if nodes.is_empty() {
             return Ok("Nothing to read. Select a frame in Figma, or pass node_ids.".into());
         }
 
-        match detail {
-            Detail::Outline => Ok(outline::render(
-                &nodes,
-                &Budget {
-                    max_nodes: args.max_nodes.unwrap_or(300) as usize,
-                    max_depth: depth as usize,
-                },
-            )),
-            Detail::Full => {
-                let total: usize = nodes.iter().map(|n| n.count()).sum();
-                // Warn rather than silently burn someone's context window.
-                let note = if total > 120 {
-                    format!(
-                        "Note: {total} nodes. detail=\"outline\", a narrower node_ids, \
-                         or a smaller depth costs far less.\n\n"
-                    )
-                } else {
-                    String::new()
-                };
-                Ok(format!("{note}{}", pretty(&nodes)?))
-            }
-        }
+        let body = if fidelity.is_full() {
+            pretty(&nodes)?
+        } else {
+            outline::render(&nodes, &budget)
+        };
+
+        Ok(format!(
+            "{body}\n{}",
+            price_list(&nodes, fidelity, body.len())
+        ))
     }
 
     /// Figma's own CSS, not our guess at it.
@@ -630,6 +699,24 @@ impl FigmaServer {
             out.push_str(&format!("\n--- {} ---\n{}", f.path, f.contents));
         }
         Ok(out)
+    }
+}
+
+impl FigmaServer {
+    /// Call `read_scene` without going through MCP, for integration tests.
+    #[doc(hidden)]
+    pub async fn read_scene_for_test(
+        &self,
+        fidelity: Option<Fidelity>,
+    ) -> Result<String, ErrorData> {
+        self.read_scene(Parameters(ReadSceneArgs {
+            node_ids: None,
+            fidelity,
+            depth: None,
+            max_nodes: None,
+            include_css: None,
+        }))
+        .await
     }
 }
 

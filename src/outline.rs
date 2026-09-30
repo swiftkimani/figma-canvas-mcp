@@ -18,6 +18,13 @@ pub struct Budget {
     pub max_nodes: usize,
     /// How many levels to show. 1 means roots only.
     pub max_depth: usize,
+    /// Include text content and a repeated run's data values.
+    ///
+    /// Off, this is a table of contents: the skeleton of the design without the
+    /// words in it. That is genuinely a different product from a depth limit —
+    /// a shallow design is not made cheaper by capping depth, but it is made
+    /// much cheaper by dropping its content.
+    pub show_content: bool,
 }
 
 impl Default for Budget {
@@ -25,6 +32,7 @@ impl Default for Budget {
         Self {
             max_nodes: 300,
             max_depth: 12,
+            show_content: true,
         }
     }
 }
@@ -147,7 +155,7 @@ fn paint_summary(node: &Node) -> String {
     parts.join(" ")
 }
 
-fn line(node: &Node, depth: usize, out: &mut String) {
+fn line(node: &Node, depth: usize, show_content: bool, out: &mut String) {
     let indent = "  ".repeat(depth);
     let _ = write!(
         out,
@@ -178,8 +186,11 @@ fn line(node: &Node, depth: usize, out: &mut String) {
         out.push('>');
     }
 
-    // Text content is why a text node exists, so it is never elided entirely.
-    if let Some(t) = &node.text {
+    // Text content is why a text node exists, so it is never elided entirely —
+    // unless the caller asked for a skeleton, where the words are the payload.
+    if let Some(t) = &node.text
+        && show_content
+    {
         let c = t.content.replace('\n', " ");
         let shown = if c.chars().count() > 60 {
             let truncated: String = c.chars().take(57).collect();
@@ -209,7 +220,7 @@ impl Walker<'_> {
             self.unexpanded.push(node.id.clone());
             return;
         }
-        line(node, depth, out);
+        line(node, depth, self.budget.show_content, out);
         self.emitted += 1;
 
         if depth + 1 >= self.budget.max_depth {
@@ -266,7 +277,7 @@ impl Walker<'_> {
 
         let first = &run[0];
         // The representative carries the shape; walking it once is enough.
-        line(first, depth, out);
+        line(first, depth, self.budget.show_content, out);
         self.emitted += 1;
         if depth + 1 < self.budget.max_depth {
             self.walk_children(&first.children, depth + 1, out);
@@ -284,6 +295,11 @@ impl Walker<'_> {
         // The varying text is the data half of the repeat — it is what a .map()
         // would iterate, so it must not be lost to the collapse.
         let mut varying: Vec<String> = Vec::new();
+        if !self.budget.show_content {
+            out.push('\n');
+            self.emitted += run.len() - 1;
+            return;
+        }
         for node in run {
             let t = node.text_content().join(" / ");
             if !t.is_empty() {
@@ -535,6 +551,7 @@ mod tests {
             &Budget {
                 max_nodes: 5,
                 max_depth: 12,
+                show_content: true,
             },
         );
         assert!(
@@ -555,6 +572,7 @@ mod tests {
             &Budget {
                 max_nodes: 300,
                 max_depth: 1,
+                show_content: true,
             },
         );
         assert!(out.contains("below depth 1"), "{out}");

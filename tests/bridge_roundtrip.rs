@@ -492,3 +492,32 @@ async fn animations_survive_the_round_trip_into_css_and_props() {
 
     println!("--- tsx ---\n{tsx}\n--- css ---\n{sheet}");
 }
+
+#[tokio::test]
+async fn every_read_states_its_price_and_the_alternatives() {
+    let bridge = connected_bridge().await;
+    let server = figma_canvas_mcp::tools::FigmaServer::new(
+        bridge,
+        std::path::PathBuf::from("/tmp/figma-canvas-mcp-test"),
+    );
+
+    // The default level.
+    let out = server.read_scene_for_test(None).await.expect("read");
+    assert!(out.contains("nodes ·"), "a price line is missing:\n{out}");
+    assert!(out.contains("tokens spent"), "{out}");
+    assert!(out.contains("sketch"), "{out}");
+    assert!(
+        out.contains("standard ← this"),
+        "it must mark which level ran:\n{out}"
+    );
+    assert!(out.contains("precise"), "{out}");
+    assert!(out.contains("exhaustive"), "{out}");
+
+    // Cheaper levels must actually be cheaper, or the menu is a lie.
+    let price = out.rsplit('[').next().unwrap();
+    let nums: Vec<usize> = price
+        .split_whitespace()
+        .filter_map(|w| w.trim_start_matches('≈').parse::<usize>().ok())
+        .collect();
+    assert!(nums.len() >= 4, "could not parse the price line: {price}");
+}

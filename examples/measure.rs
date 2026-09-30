@@ -140,6 +140,31 @@ fn main() {
         "outline vs full-pretty: {:.0}x cheaper",
         pretty.len() as f64 / outline.len() as f64
     );
-    println!("\n--- the entire outline ---");
-    println!("{outline}");
+    use figma_canvas_mcp::outline::Budget;
+    let sketch = figma_canvas_mcp::outline::render(
+        std::slice::from_ref(&scene),
+        &Budget {
+            max_depth: 3,
+            max_nodes: 60,
+            show_content: false,
+        },
+    );
+    println!("\n--- fidelity menu, measured ---");
+    println!(
+        "sketch:     {:>6} B  ~{:>5} tokens",
+        sketch.len(),
+        tok(sketch.len())
+    );
+    println!(
+        "standard:   {:>6} B  ~{:>5} tokens",
+        outline.len(),
+        tok(outline.len())
+    );
+    println!(
+        "precise:   ~{:>6} B  ~{:>5} tokens (adds Figma CSS)",
+        compact.len() * 3,
+        tok(compact.len() * 3)
+    );
+    println!("\n--- sketch output ---");
+    println!("{}", sketch.lines().skip(7).collect::<Vec<_>>().join("\n"));
 }

@@ -301,3 +301,55 @@ fn the_per_request_schema_floor_stays_small() {
         "every request pays ~{floor} tokens for instructions plus tool schemas; budget is 2500"
     );
 }
+
+#[test]
+fn the_fidelity_levels_are_genuinely_priced_apart() {
+    use figma_canvas_mcp::outline::Budget;
+
+    let scene = realistic_screen();
+    let roots = std::slice::from_ref(&scene);
+
+    // Sketch: top levels only. Standard: full depth, collapsed.
+    // Exactly what fidelity="sketch" uses: shallow, and no content.
+    let sketch = outline::render(
+        roots,
+        &Budget {
+            max_depth: 3,
+            max_nodes: 60,
+            show_content: false,
+        },
+    );
+    let standard = outline::render(roots, &Budget::default());
+    let full = serde_json::to_string(roots).unwrap();
+
+    let (s, t, f) = (
+        tokens(sketch.len()),
+        tokens(standard.len()),
+        tokens(full.len()),
+    );
+
+    // A menu whose options cost the same is not a menu.
+    assert!(s < t, "sketch ({s}) should undercut standard ({t})");
+    assert!(t < f / 4, "standard ({t}) should be far under full ({f})");
+
+    // Each level must still be truthful about the whole design.
+    for out in [&sketch, &standard] {
+        assert!(
+            out.contains("151 node(s)"),
+            "every level must report the true total, not just what it showed"
+        );
+    }
+    // Sketch drops the words but keeps the skeleton: every node id and shape is
+    // still addressable, so a follow-up can ask for exactly what it needs.
+    assert!(
+        sketch.contains("10:0 … 10:49"),
+        "id ranges must survive:\n{sketch}"
+    );
+    assert!(sketch.contains("w:fill"), "sizing must survive:\n{sketch}");
+    assert!(
+        !sketch.contains("\"Item number 0\""),
+        "sketch should omit content; that is what makes it cheap:\n{sketch}"
+    );
+    // Standard is the level that carries the content.
+    assert!(standard.contains("\"Item number 0\""), "{standard}");
+}

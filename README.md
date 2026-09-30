@@ -143,6 +143,52 @@ Two rules drive this:
    `className`, because placement is the caller's decision while paint is the
    component's.
 
+## Choosing what to spend
+
+Every read states its own price and the alternatives, so nobody discovers the
+cost after paying it:
+
+```
+[151 nodes · ~392 tokens spent · 162 sketch · 392 standard ← this · ≈39868 precise · ≈39868 exhaustive]
+```
+
+Four levels, measured on the same 151-node screen:
+
+| `fidelity` | what you get | tokens |
+|---|---|---|
+| `sketch` | the skeleton: structure, sizing, ids — no words | ~162 |
+| `standard` *(default)* | full-depth outline with all content | ~392 |
+| `precise` | complete model plus Figma's own CSS per node | ~39,900 |
+| `exhaustive` | as `precise`, with no depth or node limit | ~39,900 |
+
+The numbers in that line are measured, not guessed — the scene is already in hand
+when the price is printed, so the other renderings are produced and counted.
+Only `precise` and `exhaustive` carry a `≈`, because Figma's per-node CSS was not
+fetched and is roughly twice the size of the model it annotates.
+
+`sketch` is a table of contents rather than a shallower tree, which matters: a
+three-level design is not made cheaper by capping depth, but it is made much
+cheaper by dropping the words. It still keeps every node id and id range, so the
+follow-up call can ask for exactly what it needs.
+
+## Runs everywhere
+
+Pure portable Rust — the crate contains **no `cfg(target_os)`, no `cfg(unix)`, no
+`cfg(windows)`**, and paths go through `PathBuf` throughout. CI runs the whole
+suite on Linux, macOS and Windows on every push.
+
+Prebuilt binaries are published for six native targets, all built on real
+hardware rather than cross-compiled:
+
+| | x86-64 | ARM64 |
+|---|---|---|
+| Linux | ✓ | ✓ |
+| macOS | ✓ (Intel) | ✓ (Apple Silicon) |
+| Windows | ✓ | ✓ |
+
+The Figma plugin is plain browser JavaScript, so it is platform-independent by
+construction.
+
 ## Token cost, and why size stops mattering
 
 Designed for small context windows, because most people are not on a large one.
@@ -336,7 +382,7 @@ WebSockets — use Figma Desktop there, or terminate TLS locally.
 ## Development
 
 ```bash
-cargo test                                      # 62 tests
+cargo test                                      # 64 tests
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all --check
 node --check plugin/code.js                     # syntax only; not a dependency
@@ -347,10 +393,10 @@ Four layers of test, all run by CI on Linux, macOS and Windows:
 | Suite | What it covers |
 |---|---|
 | unit (39) | The layout mapping, codegen rules, and motion — including a test that fails if `getCSSAsync()` ever overrides the IR's layout, and one asserting an underdamped spring actually overshoots while an overdamped one does not |
-| `tests/bridge_roundtrip.rs` (7) | The real WebSocket server driven by a fake plugin — wire protocol, IR, motion and codegen end to end, without Figma |
+| `tests/bridge_roundtrip.rs` (8) | The real WebSocket server driven by a fake plugin — wire protocol, IR, motion and codegen end to end, without Figma |
 | `tests/plugin_consistency.rs` (7) | Rust/plugin drift: port agreement across `main.rs`, `manifest.json` and `ui.html`; every op the server calls exists in the plugin and none are dead; no synchronous Figma APIs under `documentAccess: dynamic-page` |
 | `tests/mcp_stdio.rs` (3) | A real `initialize` / `tools/list` / `tools/call` handshake against the compiled binary, asserting stdout is clean JSON-RPC |
-| `tests/token_budget.rs` (6) | Enforced token budgets on a realistic 151-node screen, that cost grows sub-linearly with design size, and the per-request schema floor |
+| `tests/token_budget.rs` (7) | Enforced token budgets on a realistic 151-node screen, that cost grows sub-linearly with design size, that the fidelity levels are genuinely priced apart, and the per-request schema floor |
 
 The drift guards exist because those mismatches fail *silently at runtime* — a
 stale port is a socket that never opens, and Figma reports a plugin syntax error as

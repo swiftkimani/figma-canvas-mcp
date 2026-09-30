@@ -171,6 +171,60 @@ three-level design is not made cheaper by capping depth, but it is made much
 cheaper by dropping the words. It still keeps every node id and id range, so the
 follow-up call can ask for exactly what it needs.
 
+## It reads your codebase, not just the design
+
+Generated code that does not match the project it lands in is rework, not output.
+So before generating, the target project is inspected and the output follows its
+conventions:
+
+| detected from | affects |
+|---|---|
+| `package.json` dependencies | React · Preact · Vue · Svelte · Angular · Solid |
+| `tsconfig.json`, `typescript` dep | `.tsx` with an interface, or `.jsx` with JSDoc |
+| `tailwindcss` dep · `*.module.css` files · emotion/styled-components | how styles are emitted |
+| `tsconfig` path aliases | `@/components/Button`, not a guessed `./components/Button` |
+| `src/components`, `app/components`, … | where imports point |
+| Next.js `app/` directory | `"use client"` on anything with a handler |
+| `.prettierrc` / `prettier` key | quote style and semicolons |
+
+Point it at your repo with `--project-root`, or let it default to the working
+directory. Every conclusion carries the evidence that produced it:
+
+```
+Detected: React · TypeScript · Tailwind · alias @/ · app router
+  package.json found
+  next in dependencies
+  tailwindcss in dependencies
+  tsconfig path alias @/* -> ./src/*
+  Next.js app/ directory: client components need "use client"
+```
+
+A detector that cannot say *why* it decided something is impossible to correct,
+and when nothing is found it says so rather than pretending: *"No project
+detected; emitting React + TypeScript + CSS modules by default."*
+
+## Code that survives review
+
+Output is held to what a developer would have written by hand:
+
+- **Clickable nodes become `<button type="button">`**, not `<div onClick>`. A
+  clickable div is unreachable by keyboard and announces nothing; it fails
+  accessibility review every time.
+- **Icon-only buttons get an `aria-label`** from the layer name, because a
+  button with no text announces nothing at all.
+- **Landmarks come from layer names** — a layer called "Site header" becomes
+  `<header>`, "Main nav" becomes `<nav>`, "Sidebar" becomes `<aside>`.
+- **A repeated run becomes a `<ul>` of `<li>`s**, and the `<li>` *replaces* the
+  item's own element rather than wrapping it, so the flex relationship the
+  design depends on is preserved. Browser list defaults are reset, since the
+  design never asked for them.
+- **Identical rules are merged** into one grouped selector. Designs reuse the
+  same styling across differently-named layers constantly, and a stylesheet that
+  repeats itself is slower to parse and harder to maintain.
+- **Class names are valid JS identifiers.** css-loader does not camelCase keys by
+  default, so a `.some-class` rule would leave `styles.someClass` undefined at
+  runtime — a component that renders silently unstyled with no error anywhere.
+
 ## Runs everywhere
 
 Pure portable Rust — the crate contains **no `cfg(target_os)`, no `cfg(unix)`, no
@@ -382,7 +436,7 @@ WebSockets — use Figma Desktop there, or terminate TLS locally.
 ## Development
 
 ```bash
-cargo test                                      # 64 tests
+cargo test                                      # 76 tests
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all --check
 node --check plugin/code.js                     # syntax only; not a dependency
@@ -392,7 +446,7 @@ Four layers of test, all run by CI on Linux, macOS and Windows:
 
 | Suite | What it covers |
 |---|---|
-| unit (39) | The layout mapping, codegen rules, and motion — including a test that fails if `getCSSAsync()` ever overrides the IR's layout, and one asserting an underdamped spring actually overshoots while an overdamped one does not |
+| unit (51) | The layout mapping, codegen rules, and motion — including a test that fails if `getCSSAsync()` ever overrides the IR's layout, and one asserting an underdamped spring actually overshoots while an overdamped one does not |
 | `tests/bridge_roundtrip.rs` (8) | The real WebSocket server driven by a fake plugin — wire protocol, IR, motion and codegen end to end, without Figma |
 | `tests/plugin_consistency.rs` (7) | Rust/plugin drift: port agreement across `main.rs`, `manifest.json` and `ui.html`; every op the server calls exists in the plugin and none are dead; no synchronous Figma APIs under `documentAccess: dynamic-page` |
 | `tests/mcp_stdio.rs` (3) | A real `initialize` / `tools/list` / `tools/call` handshake against the compiled binary, asserting stdout is clean JSON-RPC |

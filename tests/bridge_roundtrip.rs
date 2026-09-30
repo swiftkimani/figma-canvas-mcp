@@ -18,6 +18,7 @@ use figma_canvas_mcp::bridge::Bridge;
 use figma_canvas_mcp::codegen::{self, StyleMode};
 use figma_canvas_mcp::ir;
 use figma_canvas_mcp::raw::RawNode;
+use figma_canvas_mcp::stack::Stack;
 
 /// A card: vertical auto-layout frame, a heading that fills the width, and a
 /// Button instance with variant props. The fill is bound to a variable.
@@ -278,7 +279,13 @@ async fn full_pipeline_generates_usable_react() {
     let vars: Vec<figma_canvas_mcp::raw::RawVariable> = serde_json::from_value(raw_vars).unwrap();
     let tokens: Vec<ir::Token> = vars.into_iter().map(ir::Token::from).collect();
 
-    let out = codegen::generate(&scene, &tokens, StyleMode::CssModules, None);
+    let out = codegen::generate(
+        &scene,
+        &tokens,
+        &Stack::default(),
+        Some(StyleMode::CssModules),
+        None,
+    );
 
     let tsx = &out
         .files
@@ -453,7 +460,13 @@ async fn animations_survive_the_round_trip_into_css_and_props() {
     assert_eq!(hover.trigger.handler(), None);
     assert!(matches!(hover.action, Action::ChangeTo { .. }));
 
-    let out = codegen::generate(&scene, &[], StyleMode::CssModules, None);
+    let out = codegen::generate(
+        &scene,
+        &[],
+        &Stack::default(),
+        Some(StyleMode::CssModules),
+        None,
+    );
     let tsx = &out
         .files
         .iter()
@@ -498,6 +511,7 @@ async fn every_read_states_its_price_and_the_alternatives() {
     let bridge = connected_bridge().await;
     let server = figma_canvas_mcp::tools::FigmaServer::new(
         bridge,
+        std::path::PathBuf::from("/tmp/figma-canvas-mcp-test"),
         std::path::PathBuf::from("/tmp/figma-canvas-mcp-test"),
     );
 

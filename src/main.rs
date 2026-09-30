@@ -25,6 +25,8 @@ OPTIONS:
     --host <HOST>              Bridge bind address [default: 127.0.0.1]
     --out-dir <DIR>            Where generate_code and export_assets write
                                [default: ./figma-out]
+    --project-root <DIR>       The project whose stack and conventions generated
+                               code should match [default: the working directory]
     --request-timeout <SECS>   How long to wait for the plugin [default: 30]
     -h, --help                 Print this help
     -V, --version              Print version
@@ -36,6 +38,7 @@ struct Args {
     host: String,
     port: u16,
     out_dir: PathBuf,
+    project_root: PathBuf,
     timeout: Duration,
 }
 
@@ -45,6 +48,7 @@ impl Default for Args {
             host: "127.0.0.1".into(),
             port: DEFAULT_BRIDGE_PORT,
             out_dir: PathBuf::from("figma-out"),
+            project_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             timeout: Duration::from_secs(30),
         }
     }
@@ -71,6 +75,7 @@ fn parse_args() -> Result<Args, String> {
             }
             "--host" => args.host = value()?,
             "--out-dir" => args.out_dir = PathBuf::from(value()?),
+            "--project-root" => args.project_root = PathBuf::from(value()?),
             "--request-timeout" => {
                 let secs: u64 = value()?
                     .parse()
@@ -127,7 +132,7 @@ async fn main() -> anyhow::Result<()> {
         args.out_dir.display()
     );
 
-    let service = tools::FigmaServer::new(bridge, args.out_dir)
+    let service = tools::FigmaServer::new(bridge, args.out_dir, args.project_root)
         .serve(stdio())
         .await
         .inspect_err(|e| tracing::error!("could not start MCP server: {e:?}"))?;

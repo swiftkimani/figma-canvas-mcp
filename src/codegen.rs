@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::css::{self, Decls};
 use crate::ir::{Layout, Node, Token, pascal_case};
 use crate::motion::{Action, Interaction};
+use crate::stack::Stack;
 
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema,
@@ -36,6 +37,8 @@ pub struct GeneratedFile {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Generated {
     pub component_name: String,
+    /// What the target project was detected to use, and why.
+    pub stack_summary: String,
     pub files: Vec<GeneratedFile>,
     /// Components referenced but not defined here — the caller already has these.
     pub imported_components: Vec<String>,
@@ -70,6 +73,14 @@ struct Substitution {
 struct Ctx {
     mode: StyleMode,
     subst: Option<Substitution>,
+    /// Classes emitted as <ul>, which need the browser's list styling removed.
+    lists: Vec<String>,
+    /// Element the next container must use, consumed once.
+    ///
+    /// Wrapping a mapped item in an extra <li> would insert a DOM level and
+    /// break the flex relationship the design depends on, so the item's own
+    /// element becomes the <li> instead.
+    force_element: Option<&'static str>,
     /// Emitted rules, in order.
     rules: Vec<Rule>,
     handlers: Vec<Handler>,
@@ -81,25 +92,37 @@ struct Ctx {
 
 impl Ctx {
     /// Stable, readable, collision-free class name from a Figma layer name.
+    /// Stable, collision-free class name from a Figma layer name.
+    ///
+    /// camelCase rather than kebab-case on purpose: CSS modules are read as
+    /// `styles.someClass`, and css-loader does **not** camelCase keys by
+    /// default. A `.some-class` rule would leave `styles.someClass` undefined at
+    /// runtime — a silently unstyled component.
     fn class_for(&mut self, node: &Node) -> String {
-        let base = kebab_case(&node.name);
-        let base = if base.is_empty() {
-            kebab_case(&node.kind)
+        let source = if node.name.trim().is_empty() {
+            &node.kind
         } else {
-            base
+            &node.name
         };
+        let mut base = camel_case(&kebab_case(source));
+        if base.is_empty() || base.starts_with(|c: char| c.is_ascii_digit()) {
+            base = format!("c{base}");
+        }
         let n = self.used.entry(base.clone()).or_insert(0);
         *n += 1;
-        if *n == 1 { base } else { format!("{base}-{n}") }
+        if *n == 1 { base } else { format!("{base}{n}") }
     }
 }
 
 pub fn generate(
     root: &Node,
     tokens: &[Token],
-    mode: StyleMode,
+    stack: &Stack,
+    mode_override: Option<StyleMode>,
     component_name: Option<&str>,
 ) -> Generated {
+    // The project's own convention wins unless the caller overrode it.
+    let mode = mode_override.unwrap_or(stack.styling);
     let name = component_name
         .map(pascal_case)
         .unwrap_or_else(|| pascal_case(&root.name));
@@ -107,6 +130,8 @@ pub fn generate(
     let mut ctx = Ctx {
         mode,
         subst: None,
+        lists: Vec::new(),
+        force_element: None,
         rules: Vec::new(),
         handlers: Vec::new(),
         used: HashMap::new(),
@@ -124,9 +149,15 @@ pub fn generate(
         StyleMode::Tailwind if !ctx.rules.is_empty() => Some(format!("{name}.css")),
         _ => None,
     };
+    let semi = if stack.semicolons { ";" } else { "" };
     let style_import = match (&sheet_name, mode) {
-        (Some(f), StyleMode::CssModules) => format!("import styles from \"./{f}\";\n"),
-        (Some(f), _) => format!("import \"./{f}\";\n"),
+        (Some(f), StyleMode::CssModules) => {
+            format!(
+                "import styles from {}{semi}\n",
+                quote(&format!("./{f}"), stack)
+            )
+        }
+        (Some(f), _) => format!("import {}{semi}\n", quote(&format!("./{f}"), stack)),
         (None, _) => String::new(),
     };
 
@@ -136,7 +167,13 @@ pub fn generate(
     } else {
         imports
             .iter()
-            .map(|c| format!("import {{ {c} }} from \"./components/{c}\";\n"))
+            .map(|c| {
+                format!(
+                    "import {{ {c} }} from {}{}\n",
+                    quote(&stack.import_path(c), stack),
+                    if stack.semicolons { ";" } else { "" }
+                )
+            })
             .collect::<Vec<_>>()
             .join("")
     };
@@ -149,12 +186,16 @@ pub fn generate(
         }
     }
 
-    let props_body = if handler_props.is_empty() {
-        "  className?: string;\n".to_string()
-    } else {
-        let mut b = String::from("  className?: string;\n");
+    // Prettier's `semi: false` applies to interface members too, so generated
+    // code should not immediately be reformatted by the project's own linter.
+    let member = if stack.semicolons { ";" } else { "" };
+    let props_body = {
+        let mut b = format!("  className?: string{member}\n");
         for h in &handler_props {
-            b.push_str(&format!("  /** {} */\n  {}?: () => void;\n", h.doc, h.prop));
+            b.push_str(&format!(
+                "  /** {} */\n  {}?: () => void{member}\n",
+                h.doc, h.prop
+            ));
         }
         b
     };
@@ -165,20 +206,59 @@ pub fn generate(
         format!("className, {}", names.join(", "))
     };
 
-    let tsx = format!(
-        "// Generated from Figma by figma-canvas-mcp. Re-generating overwrites this file.\n\
-         {component_imports}{style_import}\n\
-         export interface {name}Props {{\n{props_body}}}\n\n\
-         export function {name}({{ {destructured} }}: {name}Props) {{\n  return (\n{body}\n  );\n}}\n\n\
-         export default {name};\n"
-    );
+    // Next's app router renders on the server by default, so anything with an
+    // event handler has to opt in explicitly or it silently will not work.
+    let use_client = if stack.react_server_components && !handler_props.is_empty() {
+        format!("{}{semi}\n\n", quote("use client", stack))
+    } else {
+        String::new()
+    };
+
+    let component = if stack.typescript {
+        format!(
+            "{use_client}// Generated from Figma by figma-canvas-mcp. Re-generating overwrites this file.\n\
+             {component_imports}{style_import}\n\
+             export interface {name}Props {{\n{props_body}}}\n\n\
+             export function {name}({{ {destructured} }}: {name}Props) {{\n  return (\n{body}\n  ){semi}\n}}\n\n\
+             export default {name}{semi}\n"
+        )
+    } else {
+        // JSDoc keeps the prop contract discoverable without TypeScript.
+        let jsdoc = props_body
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| format!(" *{}", l.trim_start_matches("  ").trim_end_matches(';')))
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!(
+            "{use_client}// Generated from Figma by figma-canvas-mcp. Re-generating overwrites this file.\n\
+             {component_imports}{style_import}\n\
+             /**\n{jsdoc}\n */\n\
+             export function {name}({{ {destructured} }}) {{\n  return (\n{body}\n  ){semi}\n}}\n\n\
+             export default {name}{semi}\n"
+        )
+    };
+
     files.push(GeneratedFile {
-        path: format!("{name}.tsx"),
-        contents: tsx,
+        path: format!("{name}.{}", stack.file_extension()),
+        contents: component,
     });
 
     if let Some(sheet_file) = &sheet_name {
+        // A <ul> carries browser defaults the design never asked for.
+        for class in &ctx.lists {
+            if let Some(rule) = ctx.rules.iter_mut().find(|r| &r.selector == class) {
+                rule.decls.push(("list-style".into(), "none".into()));
+                rule.decls.push(("margin".into(), "0".into()));
+            }
+        }
+
         let mut sheet = String::from("/* Generated from Figma by figma-canvas-mcp. */\n");
+
+        // Identical rules are merged into one grouped selector. Designs reuse
+        // the same styling across differently-named layers constantly, and a
+        // stylesheet that repeats itself is slower to parse and harder to read.
+        let mut emitted: Vec<(String, String)> = Vec::new(); // (decl block, selectors)
         for rule in &ctx.rules {
             if rule.decls.is_empty() && rule.comment.is_none() {
                 continue;
@@ -187,12 +267,23 @@ pub fn generate(
                 for line in c.lines() {
                     sheet.push_str(&format!("/* {line} */\n"));
                 }
+                sheet.push_str(&format!(
+                    ".{} {{\n{}\n}}\n\n",
+                    rule.selector,
+                    css::to_block(&rule.decls, "  ")
+                ));
+                continue;
             }
-            sheet.push_str(&format!(
-                ".{} {{\n{}\n}}\n\n",
-                rule.selector,
-                css::to_block(&rule.decls, "  ")
-            ));
+            let block = css::to_block(&rule.decls, "  ");
+            match emitted.iter_mut().find(|(b, _)| b == &block) {
+                Some((_, selectors)) => {
+                    selectors.push_str(&format!(", .{}", rule.selector));
+                }
+                None => emitted.push((block, format!(".{}", rule.selector))),
+            }
+        }
+        for (block, selectors) in emitted {
+            sheet.push_str(&format!("{selectors} {{\n{block}\n}}\n\n"));
         }
         files.push(GeneratedFile {
             path: sheet_file.clone(),
@@ -208,6 +299,7 @@ pub fn generate(
     }
 
     Generated {
+        stack_summary: stack.summary(),
         component_name: name,
         files,
         imported_components: imports,
@@ -317,6 +409,15 @@ fn state_rule_comment(i: &Interaction) -> Option<String> {
 ///
 /// Shared by the instance and container paths, because a hover on a button
 /// instance is the single most common interaction in any real file.
+/// Quote a string the way this project writes strings.
+fn quote(s: &str, stack: &Stack) -> String {
+    if stack.single_quotes {
+        format!("'{}'", s.replace('\'', "\\'"))
+    } else {
+        format!("\"{}\"", s.replace('"', "\\\""))
+    }
+}
+
 fn instance_props(inst: &crate::ir::Instance) -> String {
     inst.props
         .iter()
@@ -411,7 +512,7 @@ fn emit(
                         decls: placement,
                     });
                 }
-                format!(" className={{styles.{}}}", js_ident(&class))
+                format!(" className={{styles.{}}}", class)
             }
             StyleMode::Tailwind => {
                 let (mut utils, leftover) = tailwind(&placement);
@@ -465,7 +566,7 @@ fn emit(
                 comment: None,
                 decls,
             });
-            let own = format!("styles.{}", js_ident(&class));
+            let own = format!("styles.{}", class);
             if is_root {
                 merge(own)
             } else {
@@ -521,13 +622,42 @@ fn emit(
     }
 
     // 4. Container.
-    if node.children.is_empty() {
-        return format!("{pad}<div{attr} />");
+    let tag = ctx
+        .force_element
+        .take()
+        .unwrap_or_else(|| container_element(node));
+    let mut extra = String::new();
+    if tag == "button" {
+        // Without this a button inside a form submits it.
+        extra.push_str(" type=\"button\"");
+        if let Some(label) = aria_label(node) {
+            extra.push_str(&format!(" aria-label=\"{}\"", escape_attr(&label)));
+        }
     }
 
-    let inner = emit_children(&node.children, Some(&node.layout), ctx, indent + 1);
+    if node.children.is_empty() {
+        return format!("{pad}<{tag}{attr}{extra} />");
+    }
 
-    format!("{pad}<div{attr}>\n{inner}\n{pad}</div>")
+    // A container whose children are one repeated shape is a list. Saying so in
+    // the markup costs nothing and is what a screen reader needs.
+    let list = tag == "div" && is_list(node);
+    let tag = if list { "ul" } else { tag };
+    if list {
+        ctx.lists.push(class.clone());
+    }
+
+    let inner = emit_children(&node.children, Some(&node.layout), ctx, indent + 1, list);
+    format!("{pad}<{tag}{attr}{extra}>\n{inner}\n{pad}</{tag}>")
+}
+
+/// Three or more consecutive children sharing a shape make this a list.
+fn is_list(node: &Node) -> bool {
+    if node.children.len() < MIN_RUN {
+        return false;
+    }
+    let key = node.children[0].structure_key();
+    node.children.iter().all(|c| c.structure_key() == key)
 }
 
 /// Walk siblings, rendering consecutive same-shape runs as a single `.map()`.
@@ -540,6 +670,7 @@ fn emit_children(
     parent: Option<&Layout>,
     ctx: &mut Ctx,
     indent: usize,
+    in_list: bool,
 ) -> String {
     let mut out: Vec<String> = Vec::new();
     let mut i = 0;
@@ -552,7 +683,7 @@ fn emit_children(
         let run = &children[i..j];
 
         let collapsed = if run.len() >= MIN_RUN {
-            emit_run(run, parent, ctx, indent)
+            emit_run(run, parent, ctx, indent, in_list)
         } else {
             None
         };
@@ -574,7 +705,13 @@ const MIN_RUN: usize = 3;
 
 /// Render a run as a data array plus a map, or `None` when the content does not
 /// line up cleanly and literal copies are the honest output.
-fn emit_run(run: &[Node], parent: Option<&Layout>, ctx: &mut Ctx, indent: usize) -> Option<String> {
+fn emit_run(
+    run: &[Node],
+    parent: Option<&Layout>,
+    ctx: &mut Ctx,
+    indent: usize,
+    in_list: bool,
+) -> Option<String> {
     let slots: Vec<Vec<(&str, &str)>> = run.iter().map(|n| n.text_slots()).collect();
     let width = slots[0].len();
     // Uneven content means these are not really one template.
@@ -611,7 +748,11 @@ fn emit_run(run: &[Node], parent: Option<&Layout>, ctx: &mut Ctx, indent: usize)
 
     // Render the first item as the template, its content replaced by the data.
     let previous = ctx.subst.replace(Substitution { exprs, next: 0 });
+    if in_list {
+        ctx.force_element = Some("li");
+    }
     let template = emit(&run[0], parent, ctx, indent + 1, false);
+    ctx.force_element = None;
     ctx.subst = previous;
 
     Some(format!(
@@ -643,14 +784,73 @@ fn unique_fields(slots: &[(&str, &str)]) -> Vec<String> {
 /// React needs a key on mapped elements; the index is the honest default when
 /// the design gives us no stable id.
 fn add_key(template: &str) -> String {
-    match template.find([' ', '>', '/']) {
-        Some(pos) => format!("{} key={{i}}{}", &template[..pos], &template[pos..]),
-        None => template.to_string(),
-    }
+    // The template is indented, so the first space is leading whitespace, not
+    // the end of the tag name. Find the tag itself.
+    let Some(lt) = template.find('<') else {
+        return template.to_string();
+    };
+    let after = &template[lt + 1..];
+    let end = after.find([' ', '>', '/']).unwrap_or(after.len());
+    let pos = lt + 1 + end;
+    format!("{} key={{i}}{}", &template[..pos], &template[pos..])
 }
 
 fn js_string(s: &str) -> String {
     format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+/// The HTML element a container should be.
+///
+/// A clickable `<div>` is an accessibility failure: it is not reachable by
+/// keyboard, announces nothing to a screen reader, and will not survive review.
+/// Landmarks come from layer names, which designers name meaningfully far more
+/// often than they are given credit for.
+fn container_element(node: &Node) -> &'static str {
+    // Anything with a click or key handler must be a real control.
+    if node
+        .interactions
+        .iter()
+        .any(|i| matches!(i.trigger.handler(), Some("onClick") | Some("onKeyDown")))
+    {
+        return "button";
+    }
+
+    let name = node.name.to_lowercase();
+    for (needle, tag) in [
+        ("navigation", "nav"),
+        ("navbar", "nav"),
+        ("nav", "nav"),
+        ("header", "header"),
+        ("footer", "footer"),
+        ("sidebar", "aside"),
+        ("aside", "aside"),
+        ("main", "main"),
+        ("content", "main"),
+        ("section", "section"),
+        ("article", "article"),
+        ("form", "form"),
+    ] {
+        if name
+            .split(|c: char| !c.is_alphanumeric())
+            .any(|w| w == needle)
+        {
+            return tag;
+        }
+    }
+    "div"
+}
+
+/// Accessible name for a control that has no readable text of its own.
+///
+/// An icon-only button announces nothing without this.
+fn aria_label(node: &Node) -> Option<String> {
+    if container_element(node) != "button" {
+        return None;
+    }
+    if node.text_content().iter().any(|t| !t.trim().is_empty()) {
+        return None; // its own text is the accessible name
+    }
+    Some(node.name.clone())
 }
 
 /// Guess a semantic tag from the layer name and type size.
@@ -802,16 +1002,6 @@ fn camel_case(s: &str) -> String {
     out
 }
 
-/// CSS module classes are reached as `styles.x`, so the key must be a JS ident.
-fn js_ident(class: &str) -> String {
-    let c = camel_case(class);
-    if c.is_empty() || c.starts_with(|ch: char| ch.is_ascii_digit()) {
-        format!("c{c}")
-    } else {
-        c
-    }
-}
-
 fn escape_attr(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "&quot;")
 }
@@ -827,6 +1017,13 @@ fn escape_text(s: &str) -> String {
 mod tests {
     use super::*;
     use crate::ir::{Align, Direction, Edges, Instance, Justify, Placement, Sizing, Style, Text};
+    use crate::stack::Stack;
+
+    /// Tests exercise codegen itself, not stack detection, so they pin the stack
+    /// to its defaults and name the style mode explicitly.
+    fn generate(root: &Node, tokens: &[Token], mode: StyleMode, name: Option<&str>) -> Generated {
+        super::generate(root, tokens, &Stack::default(), Some(mode), name)
+    }
 
     fn frame(name: &str, children: Vec<Node>) -> Node {
         Node {
@@ -932,10 +1129,27 @@ mod tests {
             ],
         );
         let g = generate(&root, &[], StyleMode::CssModules, None);
+        let tsx = &g.files[0].contents;
         let sheet = &g.files[1].contents;
-        assert!(sheet.contains(".row {"));
-        assert!(sheet.contains(".row-2 {"));
-        assert!(sheet.contains(".row-3 {"));
+
+        // Each element still gets its own class, so they stay independently
+        // styleable by hand afterwards.
+        for class in ["styles.row", "styles.row2", "styles.row3"] {
+            assert!(tsx.contains(class), "{class} missing from:\n{tsx}");
+        }
+        // But identical rules are merged rather than repeated three times.
+        assert!(
+            sheet.contains(".row, .row2, .row3 {"),
+            "identical rules should share a selector:\n{sheet}"
+        );
+        // Class names must be valid JS identifiers, or `styles.x` is undefined at
+        // runtime and the component renders unstyled with no error.
+        assert!(
+            !sheet
+                .lines()
+                .any(|l| l.starts_with('.') && l.split('{').next().unwrap_or("").contains('-')),
+            "selectors must not be kebab-case:\n{sheet}"
+        );
     }
 
     #[test]
@@ -1043,9 +1257,22 @@ mod tests {
             1,
             "the row should be emitted once:\n{tsx}"
         );
-        // And one CSS rule per shape, not per instance.
+        // A repeated shape is a list, and says so in the markup.
+        assert!(tsx.contains("<ul"), "a repeated run is a list:\n{tsx}");
+        assert!(tsx.contains("<li"), "items should be list items:\n{tsx}");
+        // The <li> replaces the item's div rather than wrapping it, so the flex
+        // relationship the design depends on is preserved.
+        assert!(!tsx.contains("<li>\n"), "no extra wrapper level:\n{tsx}");
+
         let sheet = &g.files[1].contents;
-        assert_eq!(sheet.matches(".label {").count(), 1, "{sheet}");
+        // The two text slots have identical styling, so they share one rule
+        // instead of appearing twice.
+        assert!(
+            sheet.contains(".label, .value {") || sheet.contains(".value, .label {"),
+            "identical rules should be merged:\n{sheet}"
+        );
+        // Browser list defaults are reset, since the design never asked for them.
+        assert!(sheet.contains("list-style: none;"), "{sheet}");
     }
 
     #[test]
@@ -1086,6 +1313,150 @@ mod tests {
             tsx.contains("Beta"),
             "no content may be lost in the fallback:\n{tsx}"
         );
+    }
+
+    fn clickable(name: &str) -> Node {
+        let mut n = frame(name, vec![text_node("Label", "Save", 14.0)]);
+        n.interactions = vec![Interaction {
+            trigger: crate::motion::Trigger::Click,
+            trigger_kind: "ON_CLICK".into(),
+            delay_ms: None,
+            action: Action::Navigate {
+                destination_id: Some("2:1".into()),
+                destination_name: Some("Next screen".into()),
+            },
+            transition: None,
+        }];
+        n
+    }
+
+    #[test]
+    fn a_clickable_node_becomes_a_real_button() {
+        let g = generate(
+            &frame("Root", vec![clickable("Save button")]),
+            &[],
+            StyleMode::CssModules,
+            None,
+        );
+        let tsx = &g.files[0].contents;
+        // A div with onClick is unreachable by keyboard and announces nothing.
+        assert!(
+            tsx.contains("<button"),
+            "clickable nodes must be buttons:\n{tsx}"
+        );
+        assert!(
+            tsx.contains("type=\"button\""),
+            "an untyped button submits its enclosing form:\n{tsx}"
+        );
+        assert!(tsx.contains("onClick={onNavigateToNextScreen}"), "{tsx}");
+    }
+
+    #[test]
+    fn an_icon_only_button_gets_an_accessible_name() {
+        let mut icon = frame("Close", vec![]);
+        icon.kind = "VECTOR".into();
+        let mut btn = frame("Close dialog", vec![icon]);
+        btn.interactions = clickable("x").interactions;
+
+        let g = generate(&frame("Root", vec![btn]), &[], StyleMode::CssModules, None);
+        let tsx = &g.files[0].contents;
+        assert!(
+            tsx.contains("aria-label=\"Close dialog\""),
+            "a button with no text announces nothing without a label:\n{tsx}"
+        );
+    }
+
+    #[test]
+    fn landmarks_come_from_layer_names() {
+        for (layer, tag) in [
+            ("Site header", "header"),
+            ("Main nav", "nav"),
+            ("Footer", "footer"),
+            ("Sidebar", "aside"),
+        ] {
+            let g = generate(
+                &frame("Root", vec![frame(layer, vec![text_node("t", "x", 14.0)])]),
+                &[],
+                StyleMode::CssModules,
+                None,
+            );
+            assert!(
+                g.files[0].contents.contains(&format!("<{tag}")),
+                "layer \"{layer}\" should become <{tag}>:\n{}",
+                g.files[0].contents
+            );
+        }
+    }
+
+    #[test]
+    fn output_follows_the_detected_project_not_our_defaults() {
+        let stack = Stack {
+            framework: crate::stack::Framework::React,
+            typescript: true,
+            styling: StyleMode::Tailwind,
+            alias: Some(("@/".into(), "src/".into())),
+            component_dir: Some("src/components".into()),
+            single_quotes: true,
+            semicolons: false,
+            react_server_components: true,
+            evidence: vec![],
+            guessed: false,
+        };
+
+        let mut btn = frame("Buy", vec![]);
+        btn.kind = "INSTANCE".into();
+        btn.instance = Some(Instance {
+            component: "Button".into(),
+            component_id: None,
+            props: BTreeMap::new(),
+            from_library: true,
+        });
+        let root = frame("Product card", vec![clickable("Open"), btn]);
+
+        // No mode override: the project's own convention must win.
+        let g = super::generate(&root, &[], &stack, None, None);
+        let tsx = &g.files[0].contents;
+
+        assert!(
+            tsx.contains("'use client'"),
+            "app router needs this:\n{tsx}"
+        );
+        assert!(
+            tsx.contains("from '@/components/Button'"),
+            "imports must use the project alias, not ./components:\n{tsx}"
+        );
+        assert!(
+            !tsx.contains(";\n"),
+            "this project has semicolons off:\n{tsx}"
+        );
+        assert!(
+            tsx.contains("className=\""),
+            "Tailwind was detected:\n{tsx}"
+        );
+        assert_eq!(g.files[0].path, "ProductCard.tsx");
+        assert!(g.stack_summary.contains("Tailwind"), "{}", g.stack_summary);
+    }
+
+    #[test]
+    fn a_javascript_project_gets_jsx_and_jsdoc_not_typescript() {
+        let stack = Stack {
+            typescript: false,
+            ..Stack::default()
+        };
+        let g = super::generate(
+            &frame("Root", vec![clickable("Go")]),
+            &[],
+            &stack,
+            Some(StyleMode::CssModules),
+            None,
+        );
+        assert_eq!(g.files[0].path, "Root.jsx");
+        let js = &g.files[0].contents;
+        assert!(!js.contains("interface"), "no TS in a JS project:\n{js}");
+        assert!(!js.contains(": RootProps"), "{js}");
+        // The prop contract survives as JSDoc rather than being lost.
+        assert!(js.contains("/**"), "{js}");
+        assert!(js.contains("onNavigateToNextScreen"), "{js}");
     }
 
     #[test]

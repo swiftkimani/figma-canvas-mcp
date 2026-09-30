@@ -19,6 +19,7 @@ use crate::ir::{self, Token};
 use crate::motion::{self, Action, Interaction};
 use crate::outline::{self, Budget};
 use crate::raw::{RawNode, RawVariable};
+use crate::stack::{self, Stack};
 
 /// What this response cost, and what the other levels would have.
 ///
@@ -186,6 +187,7 @@ pub struct GenerateArgs {
     /// How styles are emitted. Default css-modules.
     #[serde(default)]
     pub style_mode: Option<StyleMode>,
+    /// Force a styling approach. Omit to follow the project's own convention.
     /// Override the generated component name. Defaults to the frame's name.
     #[serde(default)]
     pub component_name: Option<String>,
@@ -205,12 +207,18 @@ pub struct GenerateArgs {
 pub struct FigmaServer {
     bridge: Bridge,
     out_dir: PathBuf,
+    /// The project whose conventions generated code should follow.
+    project_root: PathBuf,
 }
 
 #[tool_router]
 impl FigmaServer {
-    pub fn new(bridge: Bridge, out_dir: PathBuf) -> Self {
-        Self { bridge, out_dir }
+    pub fn new(bridge: Bridge, out_dir: PathBuf, project_root: PathBuf) -> Self {
+        Self {
+            bridge,
+            out_dir,
+            project_root,
+        }
     }
 
     async fn nodes_param(&self, ids: Option<Vec<String>>) -> Value {
@@ -409,7 +417,8 @@ impl FigmaServer {
                 children: vec![],
             },
             &tokens,
-            StyleMode::CssModules,
+            &Stack::default(),
+            Some(StyleMode::CssModules),
             None,
         );
         let sheet = css
@@ -652,10 +661,13 @@ impl FigmaServer {
         // Tokens are best-effort: a file with no variables still generates.
         let tokens = self.tokens().await.unwrap_or_default();
 
+        // Match the project this code is going to land in, rather than guessing.
+        let detected = stack::detect(&self.project_root);
         let generated = codegen::generate(
             root,
             &tokens,
-            args.style_mode.unwrap_or_default(),
+            &detected,
+            args.style_mode,
             args.component_name.as_deref(),
         );
 
@@ -676,8 +688,8 @@ impl FigmaServer {
         }
 
         out.push_str(&format!(
-            "{} from {} nodes.\n",
-            generated.component_name, generated.node_count
+            "{}\n{} from {} nodes.\n",
+            generated.stack_summary, generated.component_name, generated.node_count
         ));
         if !generated.imported_components.is_empty() {
             out.push_str(&format!(

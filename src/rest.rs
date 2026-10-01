@@ -47,12 +47,38 @@ pub struct RestClient {
 /// REST gives an instance a `componentId` and nothing else; the names live in a
 /// file-level map, so instances cannot be identified without it.
 #[derive(Default)]
-struct ComponentIndex {
+pub struct ComponentIndex {
     components: HashMap<String, RestComponent>,
     sets: HashMap<String, RestComponentSet>,
 }
 
-#[derive(Debug, Deserialize, Default)]
+impl ComponentIndex {
+    /// Build from the `components` and `componentSets` maps of a REST response.
+    ///
+    /// Both are optional: without them instances still convert, they just carry
+    /// no component name, which is worse output but not a failure.
+    pub fn from_response(value: &serde_json::Value) -> Self {
+        fn read<T: serde::de::DeserializeOwned + Default>(
+            value: &serde_json::Value,
+            key: &str,
+        ) -> HashMap<String, T> {
+            value
+                .get(key)
+                .cloned()
+                .and_then(|v| serde_json::from_value(v).ok())
+                .unwrap_or_default()
+        }
+        Self {
+            components: read(value, "components"),
+            sets: read(value, "componentSets"),
+        }
+    }
+}
+
+// Figma sends camelCase. Without this, `componentSetId` never binds and every
+// instance loses its component-set name — silently, since the field is optional.
+#[derive(Debug, Deserialize, Default, Clone)]
+#[serde(rename_all = "camelCase")]
 struct RestComponent {
     #[serde(default)]
     name: String,
@@ -62,7 +88,8 @@ struct RestComponent {
     remote: bool,
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize, Default, Clone)]
+#[serde(rename_all = "camelCase")]
 struct RestComponentSet {
     #[serde(default)]
     name: String,
@@ -192,7 +219,7 @@ impl RestClient {
                 components: entry.components,
                 sets: entry.component_sets,
             };
-            out.push(convert(&entry.document, None, &index));
+            out.push(node_from_rest(&entry.document, None, &index));
         }
         Ok(out)
     }
@@ -414,7 +441,16 @@ fn bound_variables(v: &serde_json::Value) -> std::collections::BTreeMap<String, 
     out
 }
 
-fn convert(v: &serde_json::Value, parent_box: Option<&RawRect>, index: &ComponentIndex) -> RawNode {
+/// Map one Figma REST document node onto the shared [`RawNode`] shape.
+///
+/// Public because the mapping — not the HTTP call — is the part worth reusing.
+/// Anything able to obtain Figma's REST JSON, by any means, can feed the rest of
+/// this pipeline through here.
+pub fn node_from_rest(
+    v: &serde_json::Value,
+    parent_box: Option<&RawRect>,
+    index: &ComponentIndex,
+) -> RawNode {
     let bbox = rect(v);
     let kind = s(v, "type").unwrap_or_default();
 
@@ -430,7 +466,7 @@ fn convert(v: &serde_json::Value, parent_box: Option<&RawRect>, index: &Componen
         .and_then(|c| c.as_array())
         .map(|arr| {
             arr.iter()
-                .map(|c| convert(c, bbox.as_ref(), index))
+                .map(|c| node_from_rest(c, bbox.as_ref(), index))
                 .collect()
         })
         .unwrap_or_default();
@@ -585,7 +621,7 @@ mod tests {
             }]
         });
 
-        let node = convert(&doc, None, &index_with_button());
+        let node = node_from_rest(&doc, None, &index_with_button());
 
         assert_eq!(node.layout_mode.as_deref(), Some("VERTICAL"));
         assert_eq!(node.item_spacing, Some(16.0));
@@ -627,7 +663,7 @@ mod tests {
                 "style": { "fontFamily": "Inter", "fontSize": 14.0 }
             }]
         });
-        let scene = crate::ir::build(&convert(&doc, None, &ComponentIndex::default()));
+        let scene = crate::ir::build(&node_from_rest(&doc, None, &ComponentIndex::default()));
 
         match &scene.layout {
             crate::ir::Layout::Flex {
@@ -654,12 +690,40 @@ mod tests {
     }
 
     #[test]
+    fn the_component_index_deserialises_from_figmas_actual_json() {
+        // Built from JSON rather than in Rust: constructing it by hand is what
+        // let a missing rename_all go unnoticed.
+        let response = json!({
+            "components": {
+                "10:5": { "name": "Button/primary", "componentSetId": "10:1", "remote": true }
+            },
+            "componentSets": { "10:1": { "name": "Button" } }
+        });
+        let index = ComponentIndex::from_response(&response);
+
+        let doc = json!({
+            "id": "1:1", "type": "INSTANCE", "name": "Buy", "visible": true,
+            "componentId": "10:5"
+        });
+        let inst = node_from_rest(&doc, None, &index)
+            .instance
+            .expect("instance");
+        assert_eq!(inst.component_name.as_deref(), Some("Button/primary"));
+        assert_eq!(
+            inst.component_set_name.as_deref(),
+            Some("Button"),
+            "componentSetId must bind from camelCase JSON"
+        );
+        assert!(inst.is_remote);
+    }
+
+    #[test]
     fn four_corner_radii_are_read_in_figmas_order() {
         let doc = json!({
             "id": "1:1", "type": "RECTANGLE", "visible": true,
             "rectangleCornerRadii": [1.0, 2.0, 3.0, 4.0]
         });
-        let r = convert(&doc, None, &ComponentIndex::default())
+        let r = node_from_rest(&doc, None, &ComponentIndex::default())
             .corner_radius
             .expect("radii");
         assert_eq!(

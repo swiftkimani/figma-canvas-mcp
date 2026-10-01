@@ -109,10 +109,15 @@ pub type Decls = Vec<(String, String)>;
 
 fn px(v: f64) -> String {
     if (v - v.round()).abs() < 0.01 {
-        format!("{}px", v.round() as i64)
-    } else {
-        format!("{v:.2}px")
+        return format!("{}px", v.round() as i64);
     }
+    // Two decimals, without the trailing zero `13.50px` would otherwise carry.
+    let mut t = format!("{v:.2}");
+    while t.ends_with('0') {
+        t.pop();
+    }
+    t = t.trim_end_matches('.').to_string();
+    format!("{t}px")
 }
 
 fn edges(e: &Edges) -> String {
@@ -595,6 +600,15 @@ mod tests {
 
     fn get<'a>(d: &'a Decls, k: &str) -> Option<&'a str> {
         d.iter().find(|(p, _)| p == k).map(|(_, v)| v.as_str())
+    }
+
+    #[test]
+    fn lengths_do_not_carry_trailing_zeros() {
+        assert_eq!(px(16.0), "16px");
+        assert_eq!(px(13.5), "13.5px");
+        assert_eq!(px(16.799), "16.8px");
+        assert_eq!(px(0.0), "0px");
+        assert_eq!(px(-12.25), "-12.25px");
     }
 
     #[test]

@@ -38,6 +38,32 @@ See [Which Figma tool to use](#which-figma-tool-to-use).
                                    └──────────────────────┘
 ```
 
+## When none of the readers are available
+
+The reading half of this tool keeps being the part that is unavailable: the
+plugin needs Desktop, REST needs a token, Figma's own connector needs edit
+access. A person can have none of those and still be perfectly able to see the
+file.
+
+Everything *after* reading works on any source, so hand it the JSON however you
+got it:
+
+```
+convert nodes=<the JSON your client already fetched>
+```
+
+It accepts a REST `/v1/files/:key/nodes` response, a single node entry, a bare
+document node, or this tool's own plugin projection — told apart automatically
+by how each carries text. Then it runs the full pipeline: auto-layout as real
+flexbox, repeated structures collapsed into list renders, component identity,
+your project's conventions, verified imports, a design health report, and the
+files.
+
+That inverts the dependency. Instead of this tool needing privileged access it
+may not be able to get, your client uses whatever it already has — browser
+automation, a `curl` with your own token, a pasted response — and hands the
+result to the part that is actually hard.
+
 ## Which Figma tool to use
 
 Three ways to read a Figma file, with genuinely different requirements:
@@ -240,6 +266,7 @@ enough to identify it.
 | `get_interactions` | Prototype triggers, actions, and motion — durations, easing, and the screen flow |
 | `generate_code` | React + TypeScript, with CSS modules, Tailwind, or inline styles |
 | **`auto`** | **All of the above in one call** — read, assess, detect stack, verify, generate, export, write |
+| **`convert`** | **Run the whole pipeline on Figma JSON you already have, from any source** |
 | `open_design` | Open a Figma URL in your default browser, alongside the read |
 
 ## Install, in more detail

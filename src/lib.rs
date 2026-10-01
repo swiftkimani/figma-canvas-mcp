@@ -15,6 +15,7 @@ pub mod codegen;
 pub mod css;
 pub mod doctor;
 pub mod health;
+pub mod ingest;
 pub mod ir;
 pub mod lsp;
 pub mod motion;

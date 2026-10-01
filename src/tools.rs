@@ -20,6 +20,7 @@ use serde_json::{Value, json};
 use crate::bridge::Bridge;
 use crate::codegen::{self, StyleMode};
 use crate::health;
+use crate::ingest;
 use crate::ir::{self, Token};
 use crate::lsp::{self, LspClient};
 use crate::motion::{self, Action, Interaction};
@@ -156,13 +157,8 @@ impl Fidelity {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ReadSceneArgs {
-    /// A Figma URL to read over the REST API, e.g.
-    /// https://figma.com/design/<key>/<name>?node-id=1-2
-    ///
-    /// Use this when the plugin bridge is unavailable: REST needs only view
-    /// access and no Desktop app, so it is the route that works from a browser.
-    /// Requires FIGMA_TOKEN in the environment. Omit to read the live selection
-    /// through the plugin instead.
+    /// Figma URL to read over REST. Needs FIGMA_TOKEN and only view access;
+    /// no Desktop app. Omit to read the live selection through the plugin.
     #[serde(default)]
     pub url: Option<String>,
     /// Figma node ids to read. Omit to use the current selection in Figma.
@@ -185,8 +181,8 @@ pub struct ReadSceneArgs {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct AutoArgs {
-    /// A Figma URL to read. Needs FIGMA_TOKEN and only view access.
-    /// Omit to use the live selection through the plugin instead.
+    /// Figma URL to read. Needs FIGMA_TOKEN; view access is enough.
+    /// Omit to use the live selection.
     #[serde(default)]
     pub url: Option<String>,
     /// Figma node ids. Omit to use the URL's node-id, or the selection.
@@ -198,13 +194,28 @@ pub struct AutoArgs {
     /// Force a styling approach. Omit to follow the project's own convention.
     #[serde(default)]
     pub style_mode: Option<StyleMode>,
-    /// Write the files to --out-dir. Default true; this tool exists to finish
-    /// the job rather than hand back a transcript.
+    /// Write the files to --out-dir. Default true.
     #[serde(default)]
     pub write: Option<bool>,
     /// Also export any vector nodes the code references. Default true.
     #[serde(default)]
     pub export_assets: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ConvertArgs {
+    /// Figma JSON. Shapes are detected automatically. Include the `components`
+    /// index when you have it, or instances lose their names.
+    pub nodes: serde_json::Value,
+    /// Override the component name. Defaults to the frame's name.
+    #[serde(default)]
+    pub component_name: Option<String>,
+    /// Force a styling approach. Omit to follow the project's own convention.
+    #[serde(default)]
+    pub style_mode: Option<StyleMode>,
+    /// Write the files to --out-dir. Default true.
+    #[serde(default)]
+    pub write: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -246,8 +257,7 @@ pub struct ExportArgs {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct GenerateArgs {
-    /// A Figma URL to read over REST instead of the live selection. Needs only
-    /// view access and FIGMA_TOKEN; no plugin or Desktop app.
+    /// Figma URL to read over REST. Needs FIGMA_TOKEN; view access is enough.
     #[serde(default)]
     pub url: Option<String>,
     /// Figma node ids. Omit to use the current selection.
@@ -486,9 +496,8 @@ impl FigmaServer {
     /// Call this first when anything else fails — it distinguishes "plugin not
     /// open" from "wrong node id".
     #[tool(
-        description = "Check the Figma bridge: whether the plugin is connected, whether it is \
-                       running in Figma Desktop or a browser tab, which file is open, and what \
-                       is currently selected."
+        description = "Check the bridge: whether the plugin is connected, Desktop or browser, \
+                       which file is open, and the current selection."
     )]
     async fn figma_status(&self) -> Result<String, ErrorData> {
         let s = self.bridge.status().await;
@@ -585,11 +594,10 @@ impl FigmaServer {
 
     /// The reconstruction: a normalized, code-ready model of the canvas.
     #[tool(
-        description = "Read the canvas: nesting, auto-layout as flexbox semantics, sizing, \
-                       token-named paint, text, and component/variant identity. fidelity is \
-                       sketch | standard (default) | precise | exhaustive, each costing more \
-                       than the last; every response reports what it spent and what the other \
-                       levels would cost. Use this instead of a screenshot."
+        description = "Read the canvas: nesting, auto-layout as flexbox, sizing, token-named \
+                       paint, text, component identity. fidelity: sketch | standard (default) | \
+                       precise | exhaustive, each dearer; every response states its cost. Use \
+                       instead of a screenshot."
     )]
     async fn read_scene(
         &self,
@@ -778,10 +786,9 @@ impl FigmaServer {
 
     /// Component identity, so generated JSX references components.
     #[tool(
-        description = "Inventory the component instances in a selection: which component or \
-                       component set each instance came from, its variant property values, and \
-                       whether it is from a shared library. This is what lets generated code emit \
-                       <Button variant=\"primary\"> instead of a stack of divs."
+        description = "Inventory component instances: which component or set each came from, \
+                       its variant values, and whether it is from a shared library. This is what \
+                       lets output emit <Button variant=\"primary\"> instead of nested divs."
     )]
     async fn get_components(
         &self,
@@ -794,9 +801,8 @@ impl FigmaServer {
 
     /// Assets at any scale, written to disk.
     #[tool(
-        description = "Export nodes as real asset files (SVG, PNG, JPG, PDF) at any scale and write \
-                       them to disk. Use for vectors, logos and images, which CSS cannot honestly \
-                       reproduce."
+        description = "Export nodes as SVG, PNG, JPG or PDF at any scale and write them to \
+                       disk. For vectors, logos and images, which CSS cannot reproduce."
     )]
     async fn export_assets(
         &self,
@@ -851,13 +857,11 @@ impl FigmaServer {
 
     /// Motion and flow: what the prototype actually does.
     #[tool(
-        description = "Read the prototype interactions on a selection: triggers (click, hover, \
-                       press, timeout), actions (navigate, open overlay, swap variant, set \
-                       variable, open URL), and the motion for each — transition type, duration \
-                       in ms, and a CSS-ready easing. Spring easings are simulated into a CSS \
-                       linear() stop list rather than approximated, and the raw spring parameters \
-                       are returned for motion libraries. Also summarises the screen-to-screen \
-                       flow, which is the prototype's routing."
+        description = "Prototype interactions: triggers (click, hover, press, timeout), actions \
+                       (navigate, overlay, variant swap, set variable, URL), and motion for each \
+                       — type, duration in ms, CSS-ready easing. Springs are simulated into a \
+                       linear() stop list, with raw parameters kept for motion libraries. Also \
+                       summarises the screen-to-screen flow."
     )]
     async fn get_interactions(
         &self,
@@ -947,11 +951,10 @@ impl FigmaServer {
 
     /// Everything, in one call.
     #[tool(
-        description = "Do the whole job in one call: read the design, assess it, detect the \
-                       target project's stack, verify components against the codebase, generate \
-                       the code, export any vectors it references, and write the files to disk. \
-                       Returns a short summary rather than a transcript. Use this instead of \
-                       chaining read_scene, get_tokens, generate_code and export_assets by hand."
+        description = "The whole job in one call: read, assess, detect the project's stack, \
+                       verify components, generate, export vectors, write files. Returns a \
+                       summary, not a transcript. Prefer this over chaining read_scene, \
+                       get_tokens, generate_code and export_assets."
     )]
     async fn auto(&self, Parameters(args): Parameters<AutoArgs>) -> Result<String, ErrorData> {
         let write = args.write.unwrap_or(true);
@@ -1087,6 +1090,102 @@ impl FigmaServer {
         Ok(out)
     }
 
+    /// Run the pipeline on design data from anywhere.
+    #[tool(
+        description = "Turn Figma JSON you already have into code, from any source: a REST \
+                       /nodes response, a node entry, a bare document node, or this tool's \
+                       plugin projection. Runs the full pipeline — flexbox layout, repeated \
+                       structures as list renders, component identity, your project's \
+                       conventions, a health report, generated files. Use when neither the \
+                       plugin nor a token is available but you can read the file some other \
+                       way, e.g. the browser."
+    )]
+    async fn convert(
+        &self,
+        Parameters(args): Parameters<ConvertArgs>,
+    ) -> Result<String, ErrorData> {
+        let ingested = ingest::ingest(&args.nodes).map_err(|e| bad(format!("{e:#}")))?;
+        let scenes: Vec<ir::Node> = ingested.nodes.iter().map(ir::build).collect();
+        let Some(root) = scenes.first() else {
+            return Ok("That payload held no nodes.".into());
+        };
+
+        let mut out = format!(
+            "Read {} as a {}.\n  {} ({} nodes, depth {})\n",
+            if scenes.len() == 1 {
+                "1 node".to_string()
+            } else {
+                format!("{} nodes", scenes.len())
+            },
+            ingested.shape.label(),
+            root.name,
+            root.count(),
+            root.depth()
+        );
+
+        // Tokens need a live source, so there are none here. Variable names
+        // still arrive on the nodes themselves when the source carried them.
+        let mut detected = stack::detect(&self.project_root);
+        let verification = self
+            .verify_components(
+                &mut detected,
+                &root.component_names().into_iter().collect::<Vec<_>>(),
+            )
+            .await;
+
+        let generated = codegen::generate(
+            root,
+            &[],
+            &detected,
+            args.style_mode,
+            args.component_name.as_deref(),
+        );
+
+        if args.write.unwrap_or(true) {
+            tokio::fs::create_dir_all(&self.out_dir)
+                .await
+                .map_err(|e| bad(format!("could not create {}: {e}", self.out_dir.display())))?;
+            out.push_str("\nWrote:\n");
+            for f in &generated.files {
+                let path = self.out_dir.join(&f.path);
+                tokio::fs::write(&path, &f.contents)
+                    .await
+                    .map_err(|e| bad(format!("could not write {}: {e}", path.display())))?;
+                out.push_str(&format!("  {}\n", path.display()));
+            }
+        } else {
+            out.push_str("\nNot written (write=false):\n");
+            for f in &generated.files {
+                out.push_str(&format!("\n--- {} ---\n{}", f.path, f.contents));
+            }
+        }
+
+        out.push_str(&format!(
+            "\n{}\n{verification}Generated {} from {} nodes.\n",
+            detected.summary(),
+            generated.component_name,
+            generated.node_count
+        ));
+        if !generated.imported_components.is_empty() {
+            out.push_str(&format!(
+                "References: {}\n",
+                generated.imported_components.join(", ")
+            ));
+        }
+        if !generated.pending_assets.is_empty() {
+            out.push_str(&format!(
+                "{} vector(s) are referenced as assets and need exporting from Figma.\n",
+                generated.pending_assets.len()
+            ));
+        }
+
+        let report = health::assess(std::slice::from_ref(root)).report();
+        if !report.is_empty() {
+            out.push_str(&format!("\n{report}"));
+        }
+        Ok(out)
+    }
+
     /// Open the file where the user can actually see it.
     #[tool(
         description = "Open a Figma URL in the user's default browser. Useful alongside a read, \
@@ -1131,11 +1230,10 @@ impl FigmaServer {
 
     /// The payoff: canvas to React.
     #[tool(
-        description = "Generate React + TypeScript from the canvas. Auto-layout becomes real \
-                       flexbox (FILL becomes flex:1, HUG becomes fit-content), variables become \
-                       CSS custom properties, component instances become component references \
-                       with their variant props, and vectors are listed for export. Styles can be \
-                       CSS modules, Tailwind or inline."
+        description = "Generate React + TypeScript. Auto-layout becomes real flexbox (FILL -> \
+                       flex:1, HUG -> fit-content), variables become CSS custom properties, \
+                       instances become component references with variant props, vectors are \
+                       listed for export. CSS modules, Tailwind or inline."
     )]
     async fn generate_code(
         &self,
